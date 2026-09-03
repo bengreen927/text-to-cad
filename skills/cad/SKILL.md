@@ -81,7 +81,7 @@ Scale depth to the task: a simple part needs a short brief and few spec-driven c
 
 1. **Classify the task.** New part, new assembly, source modification, direct STEP/STP inspection, reference selection, measurement/alignment check, snapshot review, or secondary output request.
 2. **Load only the needed references.** Use the triggers below instead of reading the whole reference set.
-3. **Write a natural-language CAD brief.** Extract dimensions, units, coordinate convention, feature intent, output paths, assumptions, and validation targets from all provided inputs — prose, reference images, technical drawings. Use `references/cad-brief.md`.
+3. **Write a natural-language CAD brief.** Extract dimensions, units, coordinate convention, feature intent, output paths, assumptions, and validation targets from all provided inputs — prose, reference images, technical drawings. Use `references/cad-brief.md`. When photographs of a real object are the only input, follow `references/reverse-engineering-from-photos.md`: measure, write one dimension table, draw the dimensioned sheets with `$dxf`, and only then model.
 4. **Check named purchasable components.** When an assembly includes named off-the-shelf actuators, servos, motors, electronics boards, connectors, or other purchasable components, search `$step-parts` before creating simplified placeholder geometry. If no exact match is found, record the miss and then use a documented envelope.
 5. **Plan before coding.** Define parameters, intent labels, source paths, expected bounding boxes, and any mating/positioning datums before editing.
 6. **Edit source, not generated artifacts.** Author build123d Python with `gen_step()`, naming a buildable entry generator `<name>.step.py` (helper/library modules stay `<name>.py`; see `references/step-generation.md`). When a Python generator exists, run `scripts/gen` on the generator, never on its exported STEP. Imported STEP/STP files (no generator) need no build step: inspect, snapshot, and the CAD Viewer generate their render artifacts on demand, and `scripts/export` accepts them directly.
@@ -109,6 +109,7 @@ When verification snapshots are generated, include the saved PNG/GIF snapshot(s)
 Load these files only when their trigger applies:
 
 - `references/cad-brief.md` — converting prose, reference images, and technical drawings into a CAD brief.
+- `references/reverse-engineering-from-photos.md` — when photographs are the only input: scale and parallax, pixel measurement, one shared dimension table, dimensioned 2D sheets before the 3D model, independent review.
 - `references/build123d-modeling.md` — build123d modeling patterns, topology, selectors, features, labels.
 - `references/step-generation.md` — STEP generation from Python source, direct STEP/STP imports, and post-generation steps.
 - `references/inspection-and-validation.md` — validation sequence, selector refs, facts, planes, measurements, alignment, diff, frame, and validation reporting.

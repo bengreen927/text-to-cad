@@ -30,7 +30,7 @@ The sibling `<name>.dxf` file is written **on demand only** (`--write`, `-o`, or
 
 ## The three DXF workflows
 
-Copy the full generator template for the applicable workflow from `references/generator-templates.md` when creating a new drawing.
+Copy the full generator template for the applicable workflow from `references/generator-templates.md` when creating a new drawing. For dimensioned engineering sheets (title block, views, dimensions, notes, tables) read `references/engineering-drawing-sheets.md`: it covers the layer tokens, the missing `HIDDEN` linetype, the dimension-style corrections (`dimlfac`, `dimzin`, `dimrnd`), and true-size PDF export.
 
 1. **DXF generated from scratch** (standalone drafting — gaskets, panels, templates, cut layouts with no 3D model behind them): a `<name>.dxf.py` that builds an `ezdxf` document directly.
 
