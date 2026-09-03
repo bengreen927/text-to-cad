@@ -35,7 +35,7 @@ units (0.0 is not "no rounding" here; leave `dimrnd` unset).
 st = doc.dimstyles.duplicate_entry("EZDXF", "RX")
 st.dxf.dimlfac = 1.0          # measurements in drawing units
 st.dxf.dimdec = 1             # one decimal
-st.dxf.dimzin = 0             # keep the decimal (8 would strip "85.0" to "85" and "103.6" to "104")
+st.dxf.dimzin = 0             # keep the decimal (8 would strip "85.0" to "85" and, with dimrnd set, "103.6" to "104")
 st.dxf.dimdsep = ord(".")
 st.dxf.dimtxt = 2.5; st.dxf.dimasz = 2.0; st.dxf.dimexo = 1.0; st.dxf.dimexe = 1.5
 st.dxf.dimtad = 1; st.dxf.dimgap = 0.8; st.dxf.dimtih = 0; st.dxf.dimtoh = 0
