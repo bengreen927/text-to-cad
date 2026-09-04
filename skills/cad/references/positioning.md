@@ -6,6 +6,8 @@ Read this file when geometry has mating interfaces, repeated features, assembly 
 
 Positioning is authored in source and validated after generation. Do not position parts by visually dragging or by editing exported STEP geometry. Use build123d parameters, local coordinate systems, `Location` transforms, `Plane`/`Axis` datums, `cadgen.assembly.AssemblyHelper` relationships, source-level `Joint` objects when useful, and labeled assembly children.
 
+Compose placements, never overwrite them: `shape.moved(loc)` and `shape.move(loc)` apply `loc` on top of the shape's existing location, while `shape.locate(loc)` replaces it. An imported multi-solid STEP whose solids carry their own placements is scrambled by `locate`.
+
 ## Terminology
 
 Use these terms carefully:

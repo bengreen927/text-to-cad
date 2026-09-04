@@ -21,6 +21,7 @@ Two things make an O(n^2) pairwise test tractable on a 1400-occurrence assembly:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -220,25 +221,42 @@ def _selected(
     return keep
 
 
+def _clash_stats(count: int) -> dict[str, int]:
+    return {
+        "occurrences": count,
+        "pairs_total": 0,
+        "pairs_tested": 0,
+        "pairs_skipped_bbox": 0,
+        "pairs_truncated": 0,
+        "pairs_failed": 0,
+    }
+
+
 def find_clashes(
     occurrences: list[Occurrence],
     *,
     tolerance: float = DEFAULT_TOLERANCE_MM3,
     max_pairs: int | None = None,
+    errors: list[dict[str, object]] | None = None,
 ) -> tuple[list[Clash], dict[str, int]]:
     """Pairwise interference over already-placed occurrences.
 
     Returns the clashes plus counters, so a caller can tell "nothing overlapped"
-    apart from "we never actually tested anything".
+    apart from "we never actually tested anything". ``pairs_tested`` counts
+    attempts, including ``pairs_failed``. Failed or truncated pairs mean coverage
+    is incomplete, even when clashes is empty. Optional ``errors`` receives
+    JSON-compatible diagnostics without changing the two-value return contract.
     """
+    if not isfinite(tolerance) or tolerance < 0:
+        raise ValueError("tolerance must be finite and non-negative")
+    if max_pairs is not None and (not isinstance(max_pairs, int) or max_pairs < 0):
+        raise ValueError("max_pairs must be a non-negative integer or None")
+    for occurrence in occurrences:
+        if not all(isfinite(value) for value in occurrence.bbox):
+            raise ValueError(f"Non-finite occurrence bounds for {occurrence.ref}")
+
     clashes: list[Clash] = []
-    stats = {
-        "occurrences": len(occurrences),
-        "pairs_total": 0,
-        "pairs_tested": 0,
-        "pairs_skipped_bbox": 0,
-        "pairs_truncated": 0,
-    }
+    stats = _clash_stats(len(occurrences))
     count = len(occurrences)
     for i in range(count):
         first = occurrences[i]
@@ -252,24 +270,49 @@ def find_clashes(
                 stats["pairs_truncated"] += 1
                 continue
             stats["pairs_tested"] += 1
-            common = _intersection(first.shape, second.shape)
-            if common is None:
-                continue
+            stage = "intersection"
             try:
+                common = _intersection(first.shape, second.shape)
+                # A successful empty compound is non-null and measures zero.
+                # None signals IsDone() == False; a null shape is also a failure.
+                if common is None or common.IsNull():
+                    raise RuntimeError("Boolean intersection failed or returned a null shape")
+                stage = "volume"
                 volume = abs(_solid_volume(common))
-            except Exception:  # noqa: BLE001 - a degenerate common shape is not a clash
+                if not isfinite(volume):
+                    raise ValueError("Intersection volume is not finite")
+                if volume <= tolerance:
+                    continue
+                stage = "bounds"
+                bbox = _shape_bbox(common)
+                if not all(isfinite(value) for value in bbox):
+                    raise ValueError("Intersection bounds are not finite")
+            except Exception as exc:  # noqa: BLE001 - report kernel failures per pair
+                stats["pairs_failed"] += 1
+                if errors is not None:
+                    errors.append({
+                        "code": "pairFailed",
+                        "stage": stage,
+                        "a": {"ref": first.ref, "name": first.name},
+                        "b": {"ref": second.ref, "name": second.name},
+                        "message": str(exc),
+                    })
                 continue
-            if volume > tolerance:
-                clashes.append(
-                    Clash(
-                        a_ref=first.ref,
-                        a_name=first.name,
-                        b_ref=second.ref,
-                        b_name=second.name,
-                        volume=volume,
-                        bbox=_shape_bbox(common),
-                    )
+            clashes.append(
+                Clash(
+                    a_ref=first.ref,
+                    a_name=first.name,
+                    b_ref=second.ref,
+                    b_name=second.name,
+                    volume=volume,
+                    bbox=bbox,
                 )
+            )
+    if stats["pairs_truncated"] and errors is not None:
+        errors.append({
+            "code": "pairsTruncated",
+            "message": f"Pair limit left {stats['pairs_truncated']} candidate pairs untested",
+        })
     clashes.sort(key=lambda clash: clash.volume, reverse=True)
     return clashes, stats
 
@@ -302,13 +345,22 @@ def inspect_interference(
     occurrences = _selected(
         occurrences_from_scene(scene), refs, label_rows=scene_label_rows(scene), entry_target=str(entry)
     )
-    clashes, stats = find_clashes(occurrences, tolerance=tolerance, max_pairs=max_pairs)
+    errors: list[dict[str, object]] = []
+    if not occurrences:
+        errors.append({"code": "emptySelection", "message": "No solid occurrences were selected for interference checking"})
+    try:
+        clashes, stats = find_clashes(occurrences, tolerance=tolerance, max_pairs=max_pairs, errors=errors)
+    except ValueError as exc:
+        clashes, stats = [], _clash_stats(len(occurrences))
+        errors.append({"code": "invalidInput", "message": str(exc)})
+    complete = not errors and stats["pairs_failed"] == 0 and stats["pairs_truncated"] == 0
     return {
-        "ok": not clashes,
+        "ok": complete and not clashes,
+        "complete": complete,
         "entry": target.cad_path,
-        "tolerance": tolerance,
+        "tolerance": tolerance if isfinite(tolerance) else None,
         "stats": stats,
         "clashCount": len(clashes),
         "clashes": [clash.as_dict() for clash in clashes],
-        "errors": [],
+        "errors": errors,
     }

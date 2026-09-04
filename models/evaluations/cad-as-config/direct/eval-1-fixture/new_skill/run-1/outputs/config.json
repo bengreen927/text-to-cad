@@ -1,0 +1,28 @@
+{
+  "units": "mm",
+  "frame": "bottom center; +Z up; connector +Y",
+  "variants": {
+    "nominal": {
+      "plate": [
+        80,
+        60
+      ],
+      "pitch": [
+        30,
+        20
+      ],
+      "stem": 20
+    },
+    "wide": {
+      "plate": [
+        100,
+        70
+      ],
+      "pitch": [
+        40,
+        25
+      ],
+      "stem": 24
+    }
+  }
+}
