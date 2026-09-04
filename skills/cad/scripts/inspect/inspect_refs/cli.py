@@ -673,8 +673,6 @@ def _format_diff_text(result: dict[str, object], *, quiet: bool, verbose: bool) 
 
 def _format_interfere_text(result: dict, *, quiet: bool = False, verbose: bool = False) -> str:
     errors = result.get("errors") or []
-    if errors:
-        return "\n".join(str(error.get("message") or error) for error in errors)
     stats = result.get("stats") or {}
     clashes = result.get("clashes") or []
     lines = [
@@ -690,10 +688,17 @@ def _format_interfere_text(result: dict, *, quiet: bool = False, verbose: bool =
     truncated = int(stats.get("pairs_truncated", 0) or 0)
     if truncated:
         lines.append(f"TRUNCATED : {truncated} pairs were not tested (--max-pairs)")
+    incomplete = bool(errors or truncated or stats.get("pairs_failed") or result.get("complete") is False)
+    for error in errors:
+        lines.append(f"error     : {error.get('message') or error}")
+    if incomplete:
+        lines.append(f"result    : INCOMPLETE - {len(clashes)} measured clash(es); {stats.get('pairs_failed', 0)} failed pair(s)")
     if not clashes:
-        lines.append("result    : PASS - no interpenetration above tolerance")
+        if not incomplete:
+            lines.append("result    : PASS - no interpenetration above tolerance")
         return "\n".join(lines)
-    lines.append(f"result    : FAIL - {len(clashes)} clash(es)")
+    if not incomplete:
+        lines.append(f"result    : FAIL - {len(clashes)} clash(es)")
     for clash in clashes:
         a = clash.get("a") or {}
         b = clash.get("b") or {}

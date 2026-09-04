@@ -1,0 +1,28 @@
+{
+  "units": "mm",
+  "frame": "bottom center; +Z up; connector +Y",
+  "variants": {
+    "nominal": {
+      "cavity": [
+        64,
+        44
+      ],
+      "wall": 2,
+      "floor": 2,
+      "depth": 14,
+      "radius": 3,
+      "standoff": 4
+    },
+    "wide": {
+      "cavity": [
+        70,
+        48
+      ],
+      "wall": 2,
+      "floor": 2,
+      "depth": 14,
+      "radius": 3,
+      "standoff": 4
+    }
+  }
+}

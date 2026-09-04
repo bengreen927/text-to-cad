@@ -132,3 +132,45 @@ if __name__ == "__main__":
 - **Circles**: emit holes with `flatten.add_shapely_geometry` (fits circles
   from projected rings automatically) or `flatten.add_circle_polyline` when
   drafting directly.
+
+## 4. Dimensioned engineering sheet
+
+For a drawing with a title block, orthographic views, dimensions, notes and tables. The document
+contains DIMENSION entities, so the validator treats it as a drawing and relaxes the closed-profile
+rule. Full settings and the export recipe are in `engineering-drawing-sheets.md`.
+
+```python
+"""Sheet N: <part> - <views>."""
+
+from __future__ import annotations
+
+import ezdxf
+
+SHEET_W, SHEET_H, MARGIN = 420.0, 297.0, 10.0   # A3 landscape, drawn 1:1 in modelspace
+
+
+def gen_dxf():
+    doc = ezdxf.new("R2010", setup=True)
+    doc.units = ezdxf.units.MM
+    doc.header["$LTSCALE"] = 0.5
+    if "HIDDEN" not in doc.linetypes:
+        doc.linetypes.add("HIDDEN", pattern=[9.525, 6.35, -3.175], description="Hidden __ __ __ __")
+    doc.layers.add("PROFILE_VISIBLE", color=7)
+    doc.layers.add("REFERENCE_HIDDEN", color=8, linetype="HIDDEN")
+    doc.layers.add("REFERENCE_DIM", color=5)
+    doc.layers.add("REFERENCE_TITLE", color=7)
+    st = doc.dimstyles.duplicate_entry("EZDXF", "RX")
+    st.dxf.dimlfac = 1.0; st.dxf.dimdec = 1; st.dxf.dimzin = 0; st.dxf.dimdsep = ord(".")
+    st.dxf.dimtxt = 2.5; st.dxf.dimasz = 2.0; st.dxf.dimtad = 1        # never set dimrnd
+    msp = doc.modelspace()
+    msp.add_lwpolyline([(MARGIN, MARGIN), (SHEET_W - MARGIN, MARGIN), (SHEET_W - MARGIN, SHEET_H - MARGIN), (MARGIN, SHEET_H - MARGIN)],
+                       close=True, dxfattribs={"layer": "REFERENCE_TITLE"})
+    # TODO: title block, views on PROFILE_VISIBLE, hidden lines on REFERENCE_HIDDEN
+    msp.add_lwpolyline([(60, 150), (100, 150), (100, 170), (60, 170)], close=True, dxfattribs={"layer": "PROFILE_VISIBLE"})
+    msp.add_linear_dim(base=(60, 142), p1=(60, 150), p2=(100, 150), dimstyle="RX", dxfattribs={"layer": "REFERENCE_DIM"}).render()
+    return {"document": doc}
+
+
+if __name__ == "__main__":
+    gen_dxf()
+```

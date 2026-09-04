@@ -1,0 +1,9 @@
+*.step
+*.png
+*.manifest.json
+__pycache__/
+**/grading.json
+**/worker*.json
+**/[0-9].json
+__cadgen__/
+reproduced-results.json

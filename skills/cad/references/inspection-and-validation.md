@@ -132,8 +132,9 @@ use one of: #cast_rim:5spoke_1 (o1.7.2), #cast_rim:5spoke_2 (o1.14.2)
 1. Generation completed and the STEP/STP file exists.
 2. `refs --facts --planes --positioning` confirms scale, labels, major planes, and placement-ready references. Run this for every generated artifact.
 3. `validate` confirms the geometry is sound: valid topology, closed shells, no self-intersection, and positive volume on every solid. Run this for every generated artifact.
-4. Spec-driven checks: `measure` for every user-specified dimension, offset, or clearance; `align` for interfaces that should be flush or centered; `frame` for orientation and occurrence-placement expectations; `diff` for modifications that could affect unrelated geometry.
-5. Snapshot the primary STEP/STP per `snapshot-review.md`, then convert every visual concern into a deterministic geometry check before it becomes a validation claim.
+4. `interfere` reports every pair of leaf parts that share volume, as boolean intersection volume in mm^3 after a bounding-box reject. Run this for every generated assembly; verify errors and pair coverage as well as reported overlaps; truncated or failed checks are incomplete.
+5. Spec-driven checks: `measure` for every user-specified dimension, offset, or clearance; `align` for interfaces that should be flush or centered; `frame` for orientation and occurrence-placement expectations; `diff` for modifications that could affect unrelated geometry.
+6. Snapshot the primary STEP/STP per `snapshot-review.md`, then convert every visual concern into a deterministic geometry check before it becomes a validation claim.
 
 ### `refs --facts` "ok" is not a geometry claim
 
@@ -220,6 +221,20 @@ python scripts/inspect align path/to/assembly.step \
   --mode flush \
   --axis z
 ```
+
+## Interference checks
+
+`validate` says whether each solid is sound; `interfere` says whether two solids occupy the same space. Visual review supplements these measurements; it cannot establish the absence of hidden clashes.
+
+```bash
+python scripts/inspect interfere path/to/assembly.step.py
+python scripts/inspect interfere path/to/assembly.step.py --refs o1.3,o1.7    # one subtree each
+python scripts/inspect interfere path/to/assembly.step.py --tolerance 25 --format text
+```
+
+It tests every candidate pair of leaf occurrences (a world-space bounding-box reject runs first, so most pairs never reach the boolean) and reports each pair whose intersection volume exceeds `--tolerance` (default 1.0 mm^3; touching parts share a face and yield hairline slivers, which the tolerance separates from a real interpenetration). The JSON carries `clashCount`, `stats` (pairs tested, skipped, truncated by `--max-pairs`), and one `clashes[]` entry per pair with both refs, both labels, the volume, and the overlap bounds; `ok` is false when any clash is reported.
+
+Treat every clash as a defect until the source says otherwise: model the bore, the pocket, or the thread relief, or record the pair as intended in the generator with the reason. In-generator checks and STEP round-trip verification are described in `cad-as-config.md`.
 
 ## Frame inspection
 

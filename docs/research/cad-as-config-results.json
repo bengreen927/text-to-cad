@@ -1,0 +1,287 @@
+{
+  "results": [
+    {
+      "run": "tool/eval-0-enclosure/new_skill/run-1",
+      "summary": {
+        "passed": 197,
+        "failed": 0,
+        "total": 197,
+        "pass_rate": 1.0,
+        "observed_check_pass_rate": 1.0,
+        "execution_complete": true,
+        "variants_evaluated": [
+          "nominal",
+          "wide"
+        ],
+        "runs_evaluated": 6,
+        "runs_expected": 6,
+        "runtime_seconds": 15.475
+      }
+    },
+    {
+      "run": "tool/eval-0-enclosure/old_skill/run-1",
+      "summary": {
+        "passed": 197,
+        "failed": 0,
+        "total": 197,
+        "pass_rate": 1.0,
+        "observed_check_pass_rate": 1.0,
+        "execution_complete": true,
+        "variants_evaluated": [
+          "nominal",
+          "wide"
+        ],
+        "runs_evaluated": 6,
+        "runs_expected": 6,
+        "runtime_seconds": 13.667
+      }
+    },
+    {
+      "run": "tool/eval-1-fixture/new_skill/run-1",
+      "summary": {
+        "passed": 94,
+        "failed": 0,
+        "total": 94,
+        "pass_rate": 1.0,
+        "observed_check_pass_rate": 1.0,
+        "execution_complete": true,
+        "variants_evaluated": [
+          "nominal",
+          "wide"
+        ],
+        "runs_evaluated": 6,
+        "runs_expected": 6,
+        "runtime_seconds": 11.576
+      }
+    },
+    {
+      "run": "tool/eval-1-fixture/old_skill/run-1",
+      "summary": {
+        "passed": 94,
+        "failed": 0,
+        "total": 94,
+        "pass_rate": 1.0,
+        "observed_check_pass_rate": 1.0,
+        "execution_complete": true,
+        "variants_evaluated": [
+          "nominal",
+          "wide"
+        ],
+        "runs_evaluated": 6,
+        "runs_expected": 6,
+        "runtime_seconds": 11.456
+      }
+    },
+    {
+      "run": "direct/eval-0-enclosure/new_skill/run-1",
+      "summary": {
+        "passed": 197,
+        "failed": 0,
+        "total": 197,
+        "pass_rate": 1.0,
+        "observed_check_pass_rate": 1.0,
+        "execution_complete": true,
+        "variants_evaluated": [
+          "nominal",
+          "wide"
+        ],
+        "runs_evaluated": 6,
+        "runs_expected": 6,
+        "runtime_seconds": 14.011
+      }
+    },
+    {
+      "run": "direct/eval-0-enclosure/old_skill/run-1",
+      "summary": {
+        "passed": 197,
+        "failed": 0,
+        "total": 197,
+        "pass_rate": 1.0,
+        "observed_check_pass_rate": 1.0,
+        "execution_complete": true,
+        "variants_evaluated": [
+          "nominal",
+          "wide"
+        ],
+        "runs_evaluated": 6,
+        "runs_expected": 6,
+        "runtime_seconds": 14.496
+      }
+    },
+    {
+      "run": "direct/eval-1-fixture/new_skill/run-1",
+      "summary": {
+        "passed": 94,
+        "failed": 0,
+        "total": 94,
+        "pass_rate": 1.0,
+        "observed_check_pass_rate": 1.0,
+        "execution_complete": true,
+        "variants_evaluated": [
+          "nominal",
+          "wide"
+        ],
+        "runs_evaluated": 6,
+        "runs_expected": 6,
+        "runtime_seconds": 11.88
+      }
+    },
+    {
+      "run": "direct/eval-1-fixture/old_skill/run-1",
+      "summary": {
+        "passed": 94,
+        "failed": 0,
+        "total": 94,
+        "pass_rate": 1.0,
+        "observed_check_pass_rate": 1.0,
+        "execution_complete": true,
+        "variants_evaluated": [
+          "nominal",
+          "wide"
+        ],
+        "runs_evaluated": 6,
+        "runs_expected": 6,
+        "runtime_seconds": 11.427
+      }
+    }
+  ],
+  "checker_comparison": [
+    {
+      "scenario": "truncated",
+      "baseline": {
+        "ok": true,
+        "complete": null,
+        "clashCount": 0,
+        "errors": []
+      },
+      "corrected": {
+        "ok": false,
+        "complete": false,
+        "clashCount": 0,
+        "errors": [
+          {
+            "code": "pairsTruncated",
+            "message": "Pair limit left 1 candidate pairs untested"
+          }
+        ]
+      }
+    },
+    {
+      "scenario": "boolean_failure",
+      "baseline": {
+        "ok": true,
+        "complete": null,
+        "clashCount": 0,
+        "errors": []
+      },
+      "corrected": {
+        "ok": false,
+        "complete": false,
+        "clashCount": 0,
+        "errors": [
+          {
+            "code": "pairFailed",
+            "stage": "intersection",
+            "a": {
+              "ref": "a",
+              "name": "a"
+            },
+            "b": {
+              "ref": "b",
+              "name": "b"
+            },
+            "message": "Boolean intersection failed or returned a null shape"
+          }
+        ]
+      }
+    },
+    {
+      "scenario": "nonfinite_volume",
+      "baseline": {
+        "ok": true,
+        "complete": null,
+        "clashCount": 0,
+        "errors": []
+      },
+      "corrected": {
+        "ok": false,
+        "complete": false,
+        "clashCount": 0,
+        "errors": [
+          {
+            "code": "pairFailed",
+            "stage": "volume",
+            "a": {
+              "ref": "a",
+              "name": "a"
+            },
+            "b": {
+              "ref": "b",
+              "name": "b"
+            },
+            "message": "Intersection volume is not finite"
+          }
+        ]
+      }
+    },
+    {
+      "scenario": "valid_clash",
+      "baseline": {
+        "ok": false,
+        "complete": null,
+        "clashCount": 1,
+        "errors": []
+      },
+      "corrected": {
+        "ok": false,
+        "complete": true,
+        "clashCount": 1,
+        "errors": []
+      }
+    }
+  ],
+  "environment": {
+    "build123d": "0.11.1",
+    "cadgen": "0.4.28",
+    "cadquery-ocp": "7.9.3.1.1",
+    "ezdxf": "1.4.4",
+    "python": "3.12.13 (main, Mar  3 2026, 12:39:30) [Clang 17.0.0 (clang-1700.6.3.2)]",
+    "agent_model": "gpt-6-astra, inherited parent, one run per case and arm"
+  },
+  "grader_hash": "87f6d4adddd0cb834ca2d7b13439bb08957b59393724e4d48edae3f64bfe76f4",
+  "frozen_inputs": {
+    "skills/new_skill/SKILL.md": "4af51cc44ccc9e101ee902ccae5d1b06e68c17d59e0bcae2083923c2e4d19bd7",
+    "skills/new_skill/references/build123d-modeling.md": "bc926751ac275ce0e542d8870c268a2733395763b70299f72cd90779efbcd716",
+    "skills/new_skill/references/cad-as-config.md": "b7a990e575f5ec7e8c333fea37177fcec52d22d0b2c582bb409e0eae1b311154",
+    "skills/new_skill/references/cad-brief.md": "6996bcac26706e4197a86cde2124785ab93b09a56a33d6cb52dc9a6970a03a88",
+    "skills/new_skill/references/inspection-and-validation.md": "63f401a6ca104fa2929e0b81a2b91f394c83a223cec93bd69685a8ec377e9541",
+    "skills/new_skill/references/parameters.md": "daeadc03a111922eb1ae63d6cefe16d877fb047b7aa210deb7260d324834e6b4",
+    "skills/new_skill/references/positioning.md": "f1aa44a591cb2fdc4fc2ae6e89b97c3eba896acc754d75c16d09f0ab3204ed96",
+    "skills/new_skill/references/repair-loop.md": "ee403035b6ef687a994442f0266cb6eb835a69dbdfafbc45460ec3759c6c6d87",
+    "skills/new_skill/references/reverse-engineering-from-photos.md": "2c00c5133a9db03ec9f007263cd8f1687dbb24900c2fa0d906b832a7e9fe0485",
+    "skills/new_skill/references/snapshot-review.md": "061fce2f474c475323e252cbb8eea8277f8eec53c4332638130159600401ab5e",
+    "skills/new_skill/references/step-generation.md": "75be99d81c78da212df3442c5662b00b43fb218aa42f5e13d5edfb5bc2a5cdd7",
+    "skills/new_skill/references/supported-exports.md": "0726e6bfb3bc2072de5fb346f559f3a6345509e932aa5ae7ff570f3ee2b96a3b",
+    "skills/old_skill/SKILL.md": "49f6244eb71511bd91dea306e00413fd291524bb36173b32e8ecc852fb3b1c23",
+    "skills/old_skill/references/build123d-modeling.md": "bc926751ac275ce0e542d8870c268a2733395763b70299f72cd90779efbcd716",
+    "skills/old_skill/references/cad-brief.md": "52dfaff3aff9dbbedf101c3c0d72943b071fb11ae5887c14f8655bd2e5170842",
+    "skills/old_skill/references/inspection-and-validation.md": "ae5c24baa3939ee32b405896cc1eafd80f82c5baea9adc6134a6614856c8232c",
+    "skills/old_skill/references/parameters.md": "daeadc03a111922eb1ae63d6cefe16d877fb047b7aa210deb7260d324834e6b4",
+    "skills/old_skill/references/positioning.md": "41942cfd0a60af4649d5bf39c5093630af1cde2e69f64ec4187d9ea07a0874a8",
+    "skills/old_skill/references/repair-loop.md": "ee403035b6ef687a994442f0266cb6eb835a69dbdfafbc45460ec3759c6c6d87",
+    "skills/old_skill/references/reverse-engineering-from-photos.md": "525c7431c0b52d70b7a6afc02378eecb02ef3f6120472eeb2cf7b4ef0ffaefbe",
+    "skills/old_skill/references/snapshot-review.md": "061fce2f474c475323e252cbb8eea8277f8eec53c4332638130159600401ab5e",
+    "skills/old_skill/references/step-generation.md": "75be99d81c78da212df3442c5662b00b43fb218aa42f5e13d5edfb5bc2a5cdd7",
+    "skills/old_skill/references/supported-exports.md": "0726e6bfb3bc2072de5fb346f559f3a6345509e932aa5ae7ff570f3ee2b96a3b",
+    "protocol/enclosure.md": "6850cbfd41f1b5581791c8ed92b21a27cc049f5908fb7c47341ad22b45eebbf0",
+    "protocol/fixture.md": "d7b974902851929f9436b9ee78b7adb9a648ec7916a8b12fd7009d800f0030cd",
+    "tool/eval-0-enclosure/new_skill/run-1/outputs/model.step.py": "2a037b237847208cc77f680e1f4b400421f7e0634f4bc2f6ac56eb6ae7ca8241",
+    "tool/eval-0-enclosure/old_skill/run-1/outputs/model.step.py": "03cfe823c9ec31105dd22b7f7444055f46ea877b968deea25a49581bda558644",
+    "tool/eval-1-fixture/new_skill/run-1/outputs/model.step.py": "1b799d438d17bfe1f61bdb613a846e4daf5f096456a636cd3f7d3b03d8accd22",
+    "tool/eval-1-fixture/old_skill/run-1/outputs/model.step.py": "7cb872c0d5db7f619600a18baea5a9bc82ae9318c94ae532d21ee4356eba6d72",
+    "direct/eval-0-enclosure/new_skill/run-1/outputs/model.step.py": "d2fa73ac7e2c67a6265578546378106fbea2272a299272e941253a50d7040437",
+    "direct/eval-0-enclosure/old_skill/run-1/outputs/model.step.py": "669bc84784c8763d63d95ba97d55598ae48cb9fdee0ed1ee2f74a19e27152d48",
+    "direct/eval-1-fixture/new_skill/run-1/outputs/model.step.py": "ab8c9e101526763014036e785a5650b8ae5440387c3b0c9d1c65d07c75e34765",
+    "direct/eval-1-fixture/old_skill/run-1/outputs/model.step.py": "1854545e1d37137f28c91a79dc9fa2b1204e00c12d255fff086339c59b48bcea"
+  }
+}
