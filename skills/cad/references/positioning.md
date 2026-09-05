@@ -6,6 +6,11 @@ Read this file when geometry has mating interfaces, repeated features, assembly 
 
 Positioning is authored in source and validated after generation. Do not position parts by visually dragging or by editing exported STEP geometry. Use build123d parameters, local coordinate systems, `Location` transforms, `Plane`/`Axis` datums, `cadgen.assembly.AssemblyHelper` relationships, source-level `Joint` objects when useful, and labeled assembly children.
 
+Write the frame contract beside the dimensions that control it: units, origin,
+positive axes, front face, and named mating datums. Shared and variant-driven
+projects should keep that contract with their configuration as described in
+`cad-as-config.md`.
+
 ## Terminology
 
 Use these terms carefully:
@@ -159,6 +164,10 @@ servo = asm.add(read_step("models/parts/sg90_servo.step"), "servo")
 ```
 
 Imported geometry was not authored here, so do not assume its origin or orientation. Derive mating frames from inspected geometry: run `refs --facts --planes --positioning` and `measure` against the imported part, then define `asm.rigid_frame(...)` locations from the measured faces, axes, and bolt patterns. Validate the resulting mate exactly like an authored one.
+
+Preserve an imported shape's existing placement when adding a project placement.
+Compose with `Location * shape` or `.moved()`; do not replace or flatten an
+unknown source frame. Record the source document and the datum used to place it.
 
 ## When to use build123d joints
 

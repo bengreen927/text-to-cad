@@ -14,6 +14,7 @@ The brief should answer:
 - Which faces, axes, origins, joints, or interfaces control positioning?
 - What output files are requested?
 - What must be validated before success is reported?
+- What is the one-sentence acceptance check for each part or coherent part family? If that sentence stays vague, split the task before modeling. See `cad-as-config.md`.
 
 When inputs conflict, dimensioned sources win over image proportions. When two dimensioned sources conflict — prose says one value, a drawing callout says another — flag the conflict instead of silently choosing.
 
@@ -54,6 +55,7 @@ CAD brief:
 - Positioning/mating: <interfaces, datums, child placements, joints, alignment rules>
 - Paths: <generator .py, STEP target, secondary outputs if requested>
 - Validation targets: <bbox, solid count, labels, spec-driven measurements, refs>
+- Acceptance checks: <one measurable sentence per part or part family>
 - Assumptions: <only meaningful inferred choices>
 ```
 
@@ -128,3 +130,4 @@ A brief is ready for modeling when it contains enough information to define:
 - named parameters
 - feature plan and labels
 - expected bounding box or key measurements
+- a measurable acceptance check for each part or part family

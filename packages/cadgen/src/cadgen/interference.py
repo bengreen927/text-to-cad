@@ -32,6 +32,7 @@ Two things make an O(n^2) pairwise test tractable on a 1400-occurrence assembly:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -348,12 +349,33 @@ def part_assignments(occurrences: list[Occurrence], root: str) -> dict[str, str]
     return {occurrence.ref: part_of(occurrence.ref, root) for occurrence in occurrences}
 
 
+def _clash_stats(count: int, part_count: int) -> dict[str, int]:
+    return {
+        "occurrences": count,
+        "parts": part_count,
+        "pairs_total": 0,
+        "pairs_intra_part": 0,
+        "pairs_tested": 0,
+        "pairs_skipped_bbox": 0,
+        "pairs_truncated": 0,
+        "pairs_failed": 0,
+    }
+
+
+def _validate_bounds(bounds: tuple[float, ...]) -> None:
+    if len(bounds) != 6 or not all(isfinite(value) for value in bounds):
+        raise ValueError("Bounds must contain six finite coordinates")
+    if any(bounds[axis] > bounds[axis + 3] for axis in range(3)):
+        raise ValueError("Bounds minimum must not exceed maximum")
+
+
 def find_clashes(
     occurrences: list[Occurrence],
     *,
     tolerance: float = DEFAULT_TOLERANCE_MM3,
     max_pairs: int | None = None,
     parts: dict[str, str] | None = None,
+    errors: list[dict[str, object]] | None = None,
 ) -> tuple[list[Clash], dict[str, int]]:
     """Pairwise interference over already-placed occurrences.
 
@@ -364,22 +386,32 @@ def find_clashes(
     keep it off the verdict. Without ``parts`` every body is its own part.
     Cross-part pairs are tested FIRST, so a ``max_pairs`` budget is spent on
     the pairs that can fail the check before the ones that cannot.
+    ``pairs_tested`` counts attempts, including ``pairs_failed``. Failed or
+    truncated pairs mean incomplete coverage. Optional ``errors`` receives
+    JSON-compatible diagnostics without changing the two-value return contract.
     """
+    try:
+        if isinstance(tolerance, bool) or not isfinite(tolerance) or tolerance < 0:
+            raise ValueError("tolerance must be finite and non-negative")
+        if max_pairs is not None and (
+            isinstance(max_pairs, bool) or not isinstance(max_pairs, int) or max_pairs < 0
+        ):
+            raise ValueError("max_pairs must be a non-negative integer or None")
+        for occurrence in occurrences:
+            try:
+                _validate_bounds(occurrence.bbox)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"Invalid occurrence bounds for {occurrence.ref}: {exc}") from exc
+    except (TypeError, OverflowError) as exc:
+        raise ValueError("tolerance and bounds must contain finite numbers") from exc
+
     clashes: list[Clash] = []
     part_map = parts or {}
 
     def part_ref(occurrence: Occurrence) -> str:
         return part_map.get(occurrence.ref, occurrence.ref)
 
-    stats = {
-        "occurrences": len(occurrences),
-        "parts": len({part_ref(occurrence) for occurrence in occurrences}),
-        "pairs_total": 0,
-        "pairs_intra_part": 0,
-        "pairs_tested": 0,
-        "pairs_skipped_bbox": 0,
-        "pairs_truncated": 0,
-    }
+    stats = _clash_stats(len(occurrences), len({part_ref(o) for o in occurrences}))
     count = len(occurrences)
     cross_pairs: list[tuple[Occurrence, Occurrence, str | None]] = []
     intra_pairs: list[tuple[Occurrence, Occurrence, str | None]] = []
@@ -402,25 +434,48 @@ def find_clashes(
             stats["pairs_truncated"] += 1
             continue
         stats["pairs_tested"] += 1
-        common = _intersection(first.shape, second.shape)
-        if common is None:
-            continue
+        stage = "intersection"
         try:
+            common = _intersection(first.shape, second.shape)
+            # A successful empty compound is non-null and measures zero.
+            if common is None or common.IsNull():
+                raise RuntimeError("Boolean intersection failed or returned a null shape")
+            stage = "volume"
             volume = abs(_solid_volume(common))
-        except Exception:  # noqa: BLE001 - a degenerate common shape is not a clash
+            if not isfinite(volume):
+                raise ValueError("Intersection volume is not finite")
+            if volume <= tolerance:
+                continue
+            stage = "bounds"
+            bbox = _shape_bbox(common)
+            _validate_bounds(bbox)
+        except Exception as exc:  # noqa: BLE001 - report kernel failures per pair
+            stats["pairs_failed"] += 1
+            if errors is not None:
+                errors.append({
+                    "code": "pairFailed",
+                    "stage": stage,
+                    "a": {"ref": first.ref, "name": first.name},
+                    "b": {"ref": second.ref, "name": second.name},
+                    "message": str(exc),
+                })
             continue
-        if volume > tolerance:
-            clashes.append(
-                Clash(
-                    a_ref=first.ref,
-                    a_name=first.name,
-                    b_ref=second.ref,
-                    b_name=second.name,
-                    volume=volume,
-                    bbox=_shape_bbox(common),
-                    part=shared,
-                )
+        clashes.append(
+            Clash(
+                a_ref=first.ref,
+                a_name=first.name,
+                b_ref=second.ref,
+                b_name=second.name,
+                volume=volume,
+                bbox=bbox,
+                part=shared,
             )
+        )
+    if stats["pairs_truncated"] and errors is not None:
+        errors.append({
+            "code": "pairsTruncated",
+            "message": f"Pair limit left {stats['pairs_truncated']} candidate pairs untested",
+        })
     clashes.sort(key=lambda clash: clash.volume, reverse=True)
     return clashes, stats
 
@@ -459,9 +514,24 @@ def inspect_interference(
     occurrences = _filter_selected(all_occurrences, wanted)
     root = selection_root(wanted, occurrences)
     parts = part_assignments(occurrences, root)
-    clashes, stats = find_clashes(
-        occurrences, tolerance=tolerance, max_pairs=max_pairs, parts=parts
-    )
+    errors: list[dict[str, object]] = []
+    if not occurrences:
+        errors.append({
+            "code": "emptySelection",
+            "message": "No solid occurrences were selected for interference checking",
+        })
+    try:
+        clashes, stats = find_clashes(
+            occurrences, tolerance=tolerance, max_pairs=max_pairs, parts=parts, errors=errors
+        )
+    except ValueError as exc:
+        clashes, stats = [], _clash_stats(len(occurrences), len(set(parts.values())))
+        errors.append({"code": "invalidInput", "message": str(exc)})
+    complete = not errors and stats["pairs_failed"] == 0 and stats["pairs_truncated"] == 0
+    try:
+        report_tolerance = tolerance if isfinite(tolerance) else None
+    except (TypeError, OverflowError):
+        report_tolerance = None
     # A part's own bodies overlapping is the part's own business (a motor
     # modelled inside its case); only a clash between two DIFFERENT parts fails
     # the check. Intra-part overlaps are still reported, separately.
@@ -496,16 +566,17 @@ def inspect_interference(
             "against one another"
         )
     return {
-        "ok": not cross_part and inconclusive_reason is None,
+        "ok": complete and not cross_part and inconclusive_reason is None,
+        "complete": complete,
         "entry": target.cad_path,
-        "tolerance": tolerance,
+        "tolerance": report_tolerance,
         "root": {"ref": root, "name": names.get(root, "")},
         "parts": [
             {"ref": part, "name": names.get(part, part), "bodies": bodies}
             for part, bodies in sorted(bodies_per_part.items(), key=lambda item: _ref_sort_key(item[0]))
         ],
         "stats": stats,
-        "conclusive": inconclusive_reason is None,
+        "conclusive": complete and inconclusive_reason is None,
         **({"inconclusiveReason": inconclusive_reason} if inconclusive_reason else {}),
         "clashCount": len(cross_part),
         "clashes": [clash.as_dict() for clash in cross_part],
@@ -514,7 +585,7 @@ def inspect_interference(
             {**clash.as_dict(), "part": {"ref": clash.part, "name": names.get(clash.part, clash.part)}}
             for clash in intra_part
         ],
-        "errors": [],
+        "errors": errors,
     }
 
 

@@ -9,6 +9,9 @@ verb, and the verb takes the argument the subcommand parsed.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
+import json
 import subprocess
 import sys
 import unittest
@@ -18,6 +21,57 @@ from unittest import mock
 
 
 class InspectCliFrontDoorTests(unittest.TestCase):
+    def test_incomplete_interference_text_preserves_clashes_and_coverage(self) -> None:
+        from cadgen.cli.step_inspect.cli import _format_interfere_text
+
+        result = {
+            "ok": False, "complete": False, "conclusive": False,
+            "entry": "fixture.step", "tolerance": 1,
+            "stats": {"pairs_tested": 2, "pairs_total": 3, "pairs_failed": 1, "pairs_truncated": 1},
+            "errors": [{"message": "kernel failed"}],
+            "clashes": [{"volume": 50, "a": {"name": "plate", "ref": "o1"},
+                         "b": {"name": "shaft", "ref": "o2"}}],
+            "intraPartOverlaps": [{"volume": 25, "part": {"name": "servo", "ref": "o3"}}],
+        }
+        text = _format_interfere_text(result)
+        for expected in ("INCOMPLETE", "kernel failed", "plate [o1]", "shaft [o2]", "50.0",
+                         "2 tested", "TRUNCATED", "servo [o3]", "intra-part"):
+            self.assertIn(expected, text)
+        self.assertNotIn("PASS", text)
+        result["clashes"] = []
+        self.assertNotIn("PASS", _format_interfere_text(result))
+
+    def test_each_incomplete_signal_prevents_a_text_pass(self) -> None:
+        from cadgen.cli.step_inspect.cli import _format_interfere_text
+
+        for signal in ({"complete": False}, {"errors": [{"message": "failed"}]},
+                       {"stats": {"pairs_failed": 1}}, {"stats": {"pairs_truncated": 1}}):
+            with self.subTest(signal=signal):
+                text = _format_interfere_text({"ok": False, **signal})
+                self.assertIn("INCOMPLETE", text)
+                self.assertNotIn("PASS", text)
+
+    def test_incomplete_report_through_public_verb_and_cli_exits_nonzero(self) -> None:
+        from cadgen.cli.step_inspect import cli
+
+        report = {"ok": False, "complete": False, "conclusive": False,
+                  "errors": [{"code": "pairFailed", "message": "kernel failed"}],
+                  "stats": {"pairs_failed": 1}, "clashes": []}
+        for flags in ([], ["--json"], ["--format", "text"]):
+            with self.subTest(flags=flags):
+                args = cli.build_parser().parse_args(["interfere", "fixture.step", *flags])
+                output = io.StringIO()
+                with mock.patch("cadgen.interference.inspect_interference", return_value=report), \
+                        contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertNotEqual(0, args.handler(args))
+                if "text" not in flags:
+                    emitted = json.loads(output.getvalue())
+                    self.assertFalse(emitted["ok"])
+                    self.assertFalse(emitted["complete"])
+                else:
+                    self.assertIn("INCOMPLETE", output.getvalue())
+                    self.assertNotIn("PASS", output.getvalue())
+
     def test_front_door_help_names_the_cadgen_verb(self) -> None:
         result = subprocess.run(
             [sys.executable, "-m", "cadgen.cli", "step", "inspect", "--help"],

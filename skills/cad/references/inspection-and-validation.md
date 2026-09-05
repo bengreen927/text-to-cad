@@ -145,8 +145,9 @@ use one of: #cast_rim:5spoke_1 (o1.7.2), #cast_rim:5spoke_2 (o1.14.2)
 1. Generation completed and the STEP/STP file exists.
 2. `refs --facts --planes --positioning` confirms scale, labels, major planes, and placement-ready references. Run this for every generated artifact.
 3. `validate` confirms the geometry is sound: valid topology, closed shells, no self-intersection, and positive volume on every solid. Run this for every generated artifact.
-4. Spec-driven checks: `measure` for every user-specified dimension, offset, or clearance; `align` for interfaces that should be flush or centered; `frame` for orientation and occurrence-placement expectations; `diff` for modifications that could affect unrelated geometry.
-5. Snapshot the primary STEP/STP per `snapshot-review.md`, then convert every visual concern into a deterministic geometry check before it becomes a validation claim.
+4. `interfere` checks part-vs-part shared volume for every generated assembly. Read the completeness and coverage fields as well as the clash list; an incomplete or inconclusive result does not pass.
+5. Spec-driven checks: `measure` for every user-specified dimension, offset, or clearance; `align` for interfaces that should be flush or centered; `frame` for orientation and occurrence-placement expectations; `diff` for modifications that could affect unrelated geometry.
+6. Snapshot the primary STEP/STP per `snapshot-review.md`, then convert every visual concern into a deterministic geometry check before it becomes a validation claim.
 
 ### `refs --facts` "ok" is not a geometry claim
 
@@ -224,6 +225,21 @@ parts. To test a part's own bodies against each other, name that part alone:
 
 Fewer than two bodies, or all bodies in one part, is `INCONCLUSIVE` with
 `ok:false`, not a pass: nothing that could fail was tested.
+
+Treat the result as clean only when `ok`, `complete`, and `conclusive` are all
+true, `errors` is empty, and the pair statistics match the intended scope.
+`pairs_failed` means a Boolean or measurement failed; `pairs_truncated` means
+`--max-pairs` left candidates untested. Record intentional overlap narrowly by
+pair and region or volume. Do not turn a blanket exclusion into permission for
+a new clash elsewhere.
+
+`validate` and `interfere` answer only their stated geometry questions. They do
+not prove wall thickness, hole function, fastener engagement, motion clearance,
+tolerance fit, or every requested dimension. Add requirement-specific evidence
+with `measure`, `align`, `frame`, fixed-state interference checks, or a
+project-owned verification script. Such a script is not a cadgen hook and does
+not run merely because it exists. See `cad-as-config.md` for check records and
+promotion rules.
 
 ## Reference discovery
 
@@ -315,7 +331,9 @@ Validation:
 - Bounding box: <dimensions and units>
 - Major planes/refs: <summary>
 - Positioning: <frame/measure/align results if relevant>
+- Interference: <clashes, completeness, conclusiveness, errors, and pair coverage for assemblies>
 - Feature checks: <holes, cutouts, bosses, etc.>
+- Unknown or incomplete: <required checks not run, partial results, inferred geometry>
 - Visual review: `$cad-viewer` viewer link returned; CAD `cadgen step snapshot` PNG included or skipped with reason; follow-up geometry checks for any visual findings
 ```
 

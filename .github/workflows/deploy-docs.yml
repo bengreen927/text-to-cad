@@ -33,6 +33,8 @@ concurrency:
 
 jobs:
   deploy:
+    # A fork sync updates its installed skills; upstream owns PyPI and public docs.
+    if: github.repository == 'earthtojake/text-to-cad'
     name: Deploy docs app
     runs-on: ubuntu-latest
 

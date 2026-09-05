@@ -627,8 +627,6 @@ def _format_diff_text(result: dict[str, object], *, quiet: bool, verbose: bool) 
 
 def _format_interfere_text(result: dict, *, quiet: bool = False, verbose: bool = False) -> str:
     errors = result.get("errors") or []
-    if errors:
-        return "\n".join(str(error.get("message") or error) for error in errors)
     stats = result.get("stats") or {}
     clashes = result.get("clashes") or []
     intra = result.get("intraPartOverlaps") or []
@@ -683,6 +681,19 @@ def _format_interfere_text(result: dict, *, quiet: bool = False, verbose: bool =
             out.append(f"  {label}: {len(overlaps)} overlap(s), largest {largest:.1f} mm^3")
         return out
 
+    incomplete = bool(errors or truncated or stats.get("pairs_failed") or result.get("complete") is False)
+    if incomplete:
+        for error in errors:
+            lines.append(f"error     : {error.get('message') or error}")
+        lines.append(
+            f"result    : INCOMPLETE - {len(clashes)} measured clash(es); "
+            f"{stats.get('pairs_failed', 0)} failed pair(s)"
+        )
+        if result.get("inconclusiveReason"):
+            lines.append(f"INCONCLUSIVE - {result['inconclusiveReason']}")
+        lines.extend(_clash_line(clash) for clash in clashes)
+        lines.extend(_intra_summary())
+        return "\n".join(lines)
     if not result.get("conclusive", True):
         reason = result.get("inconclusiveReason") or "no pairs were tested"
         lines.append(f"result    : INCONCLUSIVE - {reason}")
