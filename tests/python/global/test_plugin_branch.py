@@ -92,14 +92,14 @@ class PluginTreeTests(unittest.TestCase):
                           if path in tree}
         gemini = {"CADGEN_INSTALL_CHANNEL": "gemini-github", "CADGEN_AUTO_UPDATED": "1"}
         self.assertEqual(said["latest"], {
-            "claude.mcp.json": {"CADGEN_INSTALL_CHANNEL": "claude-github"},
-            "codex.mcp.json": {"CADGEN_INSTALL_CHANNEL": "codex-github"},
+            "claude.mcp.json": {"CADGEN_INSTALL_CHANNEL": "claude-github", "CADGEN_UPDATE_CHECK": "0"},
+            "codex.mcp.json": {"CADGEN_INSTALL_CHANNEL": "codex-github", "CADGEN_UPDATE_CHECK": "0"},
             "cursor.mcp.json": {"CADGEN_INSTALL_CHANNEL": "cursor-github"},
             "mcp.json": {"CADGEN_INSTALL_CHANNEL": "agent-plugins"},
             "gemini-extension.json": gemini,
         })
         self.assertEqual(said["directory"], {
-            "claude.mcp.json": {"CADGEN_INSTALL_CHANNEL": "claude-directory", "CADGEN_AUTO_UPDATED": "1"},
+            "claude.mcp.json": {"CADGEN_INSTALL_CHANNEL": "claude-directory", "CADGEN_UPDATE_CHECK": "0", "CADGEN_AUTO_UPDATED": "1"},
             "cursor.mcp.json": {"CADGEN_INSTALL_CHANNEL": "cursor-github"},
             "gemini-extension.json": gemini,
         })

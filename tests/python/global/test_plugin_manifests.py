@@ -355,8 +355,8 @@ class PluginManifestPolicyTest(unittest.TestCase):
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         said["README.md"] = json.loads(re.search(r'"env": (\{"CADGEN_INSTALL_CHANNEL"[^}]*\})', readme).group(1))
         self.assertEqual(said, {
-            "claude.mcp.json": {"CADGEN_INSTALL_CHANNEL": "claude-github"},
-            "codex.mcp.json": {"CADGEN_INSTALL_CHANNEL": "codex-github"},
+            "claude.mcp.json": {"CADGEN_INSTALL_CHANNEL": "claude-github", "CADGEN_UPDATE_CHECK": "0"},
+            "codex.mcp.json": {"CADGEN_INSTALL_CHANNEL": "codex-github", "CADGEN_UPDATE_CHECK": "0"},
             "cursor.mcp.json": {"CADGEN_INSTALL_CHANNEL": "cursor-marketplace", "CADGEN_AUTO_UPDATED": "1"},
             "mcp.json": {"CADGEN_INSTALL_CHANNEL": "agent-plugins"},
             "gemini-extension.json": {"CADGEN_INSTALL_CHANNEL": "gemini-github", "CADGEN_AUTO_UPDATED": "1"},

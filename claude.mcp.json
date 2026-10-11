@@ -13,7 +13,8 @@
         "mcp"
       ],
       "env": {
-        "CADGEN_INSTALL_CHANNEL": "claude-github"
+        "CADGEN_INSTALL_CHANNEL": "claude-github",
+        "CADGEN_UPDATE_CHECK": "0"
       }
     }
   }
