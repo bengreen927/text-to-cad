@@ -2,37 +2,41 @@
 # Shared helpers for bundling cadgen's Node builders into the packaged runtime
 # (packages/cadgen/src/cadgen/_runtime/node). Sourced by scripts/bundle/cadgen-runtime.sh.
 #
-# cadgen bakes the DXF mesh and the mesh exports by spawning a Node child
+# cadgen bakes the mesh exports by spawning a Node child
 # (packages/cadgen/src/cadgen/_internal/node_runtime.py). The builders live in
-# packages/cadgen-js/bin and import three and meshoptimizer -- a dependency GRAPH, not just
+# packages/core/bin and import three and meshoptimizer -- a dependency GRAPH, not just
 # a file -- and the wheel ships no node_modules, so each builder is esbuild-bundled into ONE
 # self-contained --platform=node file, exactly as snapshot_runtime.sh does for the browser
-# bundle. cadgen.assets resolves the result inside the distribution; a checkout resolves
-# the real packages/cadgen-js sources instead.
+# bundle. cadgen.assets resolves the result inside the distribution. Explicit
+# development overrides can select a checkout's builders after core is built.
 #
 # Source it after setting BUNDLE_REPO_ROOT, then call bundle_node_builders /
 # check_node_builders with the builder entry files.
 #
 # shellcheck shell=bash
 
-# Pinned so the committed bundles are reproducible. three and
-# meshoptimizer are read from packages/cadgen-js/package-lock.json, the one place their exact
+# Pinned so the bundles are reproducible on every machine. three and
+# meshoptimizer are read from package-lock.json, the one place their exact
 # versions are already pinned, so a dependency bump cannot silently change what ships without
-# also changing the committed bundle.
+# also changing the lockfile that produces it.
 NODE_BUILDER_ESBUILD_VERSION="${NODE_BUILDER_ESBUILD_VERSION:-0.27.7}"
 NODE_BUILDER_BUILD_DEPS_DIR="${NODE_BUILDER_BUILD_DEPS_DIR:-${BUNDLE_REPO_ROOT:?BUNDLE_REPO_ROOT must be set before sourcing node_builders.sh}/tmp/node-builder-build}"
-NODE_BUILDER_LOCKFILE="$BUNDLE_REPO_ROOT/packages/cadgen-js/package-lock.json"
+NODE_BUILDER_LOCKFILE="$BUNDLE_REPO_ROOT/package-lock.json"
 
 node_builder_locked_version() {
   local name="$1"
+  # The lockfile path travels as an ARGUMENT, not inside the script text: on
+  # Windows, Git Bash rewrites POSIX-style paths in arguments to native ones
+  # (`/d/a/x` -> `D:/a/x`), but not inside a quoted string, and Node cannot
+  # open `/d/a/x`.
   node -p "
-    const lock = require('$NODE_BUILDER_LOCKFILE');
+    const lock = require(process.argv[1]);
     const entry = lock.packages && lock.packages['node_modules/$name'];
     if (!entry || !entry.version) {
-      throw new Error('packages/cadgen-js/package-lock.json has no pinned $name');
+      throw new Error('package-lock.json has no pinned $name');
     }
     entry.version;
-  "
+  " "$NODE_BUILDER_LOCKFILE"
 }
 
 node_builder_require_tools() {
@@ -64,10 +68,10 @@ ensure_node_builder_deps() {
       meshoptimizer: '$meshoptimizer',
     };
     for (const [name, expected] of Object.entries(deps)) {
-      const actual = require('$NODE_BUILDER_BUILD_DEPS_DIR/node_modules/' + name + '/package.json').version;
+      const actual = require(process.argv[1] + '/node_modules/' + name + '/package.json').version;
       if (actual !== expected) process.exit(1);
     }
-  " 2>/dev/null; then
+  " "$NODE_BUILDER_BUILD_DEPS_DIR" 2>/dev/null; then
     return 0
   fi
 
@@ -87,7 +91,7 @@ bundle_node_builders() {
   local entry basename_out
   rm -rf "$out_dir"
   mkdir -p "$out_dir"
-  # Mark the emitted directory as ESM, matching packages/cadgen-js itself, so a builder emitted
+  # Mark the emitted directory as ESM, matching packages/core itself, so a builder emitted
   # as a bare `.js` still parses as a module rather than as CommonJS.
   printf '%s\n' '{ "type": "module" }' > "$out_dir/package.json"
   for entry in "$@"; do
@@ -100,7 +104,7 @@ bundle_node_builders() {
     # map and the pinned three/meshoptimizer out of the tmp toolchain, so the bundle is
     # hermetic on a fresh checkout with no packages/*/node_modules. A directory --alias
     # cannot do the first: it bypasses the exports map.
-    NODE_PATH="$BUNDLE_REPO_ROOT/packages:$NODE_BUILDER_BUILD_DEPS_DIR/node_modules" \
+    NODE_PATH="$BUNDLE_REPO_ROOT/node_modules:$NODE_BUILDER_BUILD_DEPS_DIR/node_modules" \
       "$NODE_BUILDER_BUILD_DEPS_DIR/node_modules/.bin/esbuild" "$entry" \
       --bundle \
       --format=esm \
@@ -136,28 +140,4 @@ node_builder_assert_not_empty() {
     echo "field names the file. Add the entry there, or import a binding it actually uses." >&2
     return 1
   fi
-}
-
-# check_node_builders <committed_bin_dir> <check_bin_dir> <label> <fix_hint> <entry_file>...
-# Rebuild into <check_bin_dir> and fail if the committed bundles differ. Runs in BOTH
-# layouts: the bundles are esbuild output from packages/ source, never a symlink, so the
-# development layout has nothing to opt out of here.
-check_node_builders() {
-  local committed_dir="$1" check_dir="$2" label="$3" fix_hint="$4"
-  shift 4
-  if [ ! -d "$committed_dir" ]; then
-    echo "Missing generated Node builders: $label" >&2
-    echo "$fix_hint" >&2
-    return 1
-  fi
-  bundle_node_builders "$check_dir" "$@" || return 1
-  local diff_path="${TMPDIR:-/tmp}/bundle-node-builders-diff.txt"
-  if ! diff -qr "$check_dir" "$committed_dir" >"$diff_path"; then
-    cat "$diff_path" >&2
-    echo "" >&2
-    echo "$label is stale." >&2
-    echo "$fix_hint" >&2
-    return 1
-  fi
-  echo "$label is up to date."
 }

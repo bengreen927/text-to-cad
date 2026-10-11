@@ -1,14 +1,20 @@
 """The pool's dispatch rule: a worker per model, an extra when it is busy, spares in reserve.
 
-Nothing waits on another build and nothing is refused: the rule is bookkeeping, so it is
-asserted against stub workers on identity and state, never on timing.
+With memory admission explicitly disabled, routing never waits on another build.
+Identity and state are asserted against stub workers; test_daemon_memory covers
+admission, reservations and reclamation separately.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
+import io
+import itertools
+import json
 import os
 import pathlib
+import queue
+import subprocess
 import sys
 import time
 import unittest
@@ -17,6 +23,9 @@ from unittest import mock
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 from cadgen.daemon import pool as pool_mod  # noqa: E402
+from tests.python.support.tmp_root import generated_cad_directory  # noqa: E402
+
+_RealWorker = pool_mod.Worker
 
 
 class _StubWorker:
@@ -62,7 +71,7 @@ class _PoolFixture(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         _StubWorker.spawned = 0
-        self.pool = pool_mod.Pool()
+        self.pool = pool_mod.Pool(policy=pool_mod.MemoryPolicy(0))
         self.addCleanup(self.pool.shutdown)
 
     def _spares(self, count: int):
@@ -123,8 +132,9 @@ class Binding(_PoolFixture):
             _settle(self.pool)
         bound = [w for w in self.pool.snapshot()["workers"] if w["model"]]
         self.assertEqual(bound, [], "a subject-less job bound a worker")
+        self.assertNotIn(worker, self.pool._workers, "an explicit zero-spare pool retained a borrowed worker")
 
-    def test_nothing_is_capped(self):
+    def test_explicitly_disabled_memory_admission_does_not_cap_workers(self):
         with self._spares(0):
             held = [self.pool.acquire(f"/m/{i}.py") for i in range(40)]
         self.assertEqual(len({w.pid for w in held}), 40)
@@ -141,6 +151,96 @@ class Binding(_PoolFixture):
 
 
 class Spares(_PoolFixture):
+    def test_repeated_borrowed_job_bursts_keep_the_same_warm_kernels(self):
+        with self._spares(2):
+            self.pool.ensure_spares()
+            _settle(self.pool)
+            initial = {worker.pid for worker in self.pool._workers}
+            for _ in range(20):
+                held = [self.pool.acquire("") for _ in range(2)]
+                _settle(self.pool)
+                self.assertEqual({worker.pid for worker in held}, initial)
+                for worker in held:
+                    self.pool.release(worker)
+                _settle(self.pool)
+            self.assertEqual(self.pool.snapshot()["imports"], 2)
+            self.assertEqual(self.pool.snapshot()["jobsServed"], 40)
+            self.assertEqual(self.pool.snapshot()["spares"], 2)
+
+    def test_failed_borrowed_worker_replenishes_spare_capacity(self):
+        with self._spares(1):
+            self.pool.ensure_spares()
+            _settle(self.pool)
+            failed = self.pool.acquire("")
+            self.pool.release(failed, healthy=False)
+            _settle(self.pool)
+            replacement = self.pool.acquire("")
+            self.assertIsNot(replacement, failed)
+            self.assertEqual(self.pool.snapshot()["imports"], 2)
+            self.pool.release(replacement)
+
+    def test_borrowed_worker_returns_when_no_replacement_fits(self):
+        with self._spares(1):
+            self.pool.ensure_spares()
+            _settle(self.pool)
+            # Memory admission can prevent the normal background replacement.
+            # Keep routing/release real while holding that refill opportunity.
+            with mock.patch.object(self.pool, "ensure_spares"):
+                worker = self.pool.acquire("")
+                imports = self.pool.snapshot()["imports"]
+                self.pool.release(worker)
+                returned = self.pool.snapshot()
+                self.assertEqual(returned["spares"], 1, returned)
+                self.assertFalse(worker.extra)
+                self.assertFalse(worker.killed)
+                again = self.pool.acquire("")
+                self.assertIs(again, worker)
+                self.assertEqual(self.pool.snapshot()["imports"], imports)
+                self.pool.release(again)
+
+    def test_borrowed_burst_reuses_surplus_workers_then_trims_to_k_after_grace(self):
+        now = [1000.0]
+        self.pool._clock = lambda: now[0]
+        with self._spares(2):
+            self.pool.ensure_spares()
+            _settle(self.pool)
+            first = [self.pool.acquire("") for _ in range(8)]
+            first_pids = {worker.pid for worker in first}
+            for worker in first:
+                self.pool.release(worker)
+            self.assertEqual(self.pool.snapshot()["spares"], 8)
+            self.assertEqual(self.pool.snapshot()["imports"], 8)
+
+            now[0] += pool_mod.BORROWED_SURPLUS_IDLE_SECONDS - 0.01
+            second = [self.pool.acquire("") for _ in range(8)]
+            self.assertEqual({worker.pid for worker in second}, first_pids)
+            self.assertEqual(self.pool.snapshot()["imports"], 8)
+            for worker in second:
+                self.pool.release(worker)
+
+            now[0] += pool_mod.BORROWED_SURPLUS_IDLE_SECONDS + 0.01
+            self.pool.unbind_idle()
+            snapshot = self.pool.snapshot()
+            self.assertEqual(snapshot["spares"], 2, snapshot)
+            retained = {worker["pid"] for worker in snapshot["workers"]}
+            self.assertEqual(len(first_pids - retained), 6)
+
+    def test_a_new_model_can_bind_a_transient_borrowed_spare(self):
+        with self._spares(1):
+            self.pool.ensure_spares()
+            _settle(self.pool)
+            burst = [self.pool.acquire("") for _ in range(2)]
+            for worker in burst:
+                self.pool.release(worker)
+            held = self.pool.acquire("")
+            before = self.pool.snapshot()["imports"]
+            model = self.pool.acquire("/m/new.py")
+            self.assertIn(model, burst)
+            self.assertIsNot(model, held)
+            self.assertEqual(self.pool.snapshot()["imports"], before)
+            self.pool.release(held)
+            self.pool.release(model)
+
     def test_ensure_spares_fills_to_k_in_the_background(self):
         with self._spares(2):
             self.pool.ensure_spares()
@@ -160,6 +260,21 @@ class Spares(_PoolFixture):
         self.assertEqual(snapshot["spares"], 2, "the spare set was not refilled")
         self.assertEqual(_StubWorker.spawned, before + 1, "exactly one replacement")
         self.pool.release(worker)
+
+    def test_a_model_bound_extra_preserves_the_warm_reserve_for_other_models(self):
+        with self._spares(1):
+            primary = self.pool.acquire("/m/a.py")
+            _settle(self.pool)
+            extra = self.pool.acquire("/m/a.py")
+            _settle(self.pool)
+            self.assertEqual(self.pool.snapshot()["spares"], 1)
+            reserve = next(worker for worker in self.pool._workers if not worker.busy)
+            other = self.pool.acquire("/m/b.py")
+            self.assertIs(other, reserve)
+            self.assertEqual(other.jobs_served, 0)
+            self.pool.release(extra)
+            self.pool.release(primary)
+            self.pool.release(other)
 
     def test_a_model_with_no_worker_takes_a_spare_not_a_spawn(self):
         with self._spares(1):
@@ -186,6 +301,34 @@ class Spares(_PoolFixture):
 
 
 class Lifecycle(_PoolFixture):
+    def test_worker_kill_never_closes_a_reader_owned_by_the_pump_thread(self):
+        class LockedReader:
+            def close(self):
+                raise AssertionError("cross-thread close would wait on the active readline lock")
+
+        proc = mock.Mock()
+        proc.poll.return_value = 0
+        proc.stdin = mock.Mock()
+        proc.stdout = LockedReader()
+        worker = _RealWorker.__new__(_RealWorker)
+        worker.proc = proc
+
+        worker.kill()
+
+        proc.stdin.close.assert_called()
+
+    def test_the_pump_thread_closes_its_own_stdout_after_eof(self):
+        stream = mock.Mock()
+        stream.__iter__ = mock.Mock(return_value=iter(()))
+        worker = _RealWorker.__new__(_RealWorker)
+        worker.proc = mock.Mock(stdout=stream)
+        worker._frames = queue.Queue()
+
+        worker._pump()
+
+        stream.close.assert_called_once_with()
+        self.assertIsNone(worker._frames.get_nowait())
+
     def test_a_crashed_worker_is_dropped_and_its_model_rebinds_fresh(self):
         with self._spares(0):
             worker = self.pool.acquire("/m/a.py")
@@ -236,7 +379,7 @@ class IdleUnbind(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.now = [1000.0]
-        self.pool = pool_mod.Pool(clock=lambda: self.now[0])
+        self.pool = pool_mod.Pool(clock=lambda: self.now[0], policy=pool_mod.MemoryPolicy(0))
         self.addCleanup(self.pool.shutdown)
 
     def test_a_bound_worker_idle_past_the_timer_becomes_a_spare(self):
@@ -284,6 +427,153 @@ class IdleUnbind(unittest.TestCase):
             self.assertEqual(busy.model, "/m/a.py", "a busy worker was unbound")
             self.assertTrue(idle.model == "" or idle.killed, "the idle worker stayed bound")
         self.pool.release(busy)
+
+
+class _StartingProcess:
+    """Stands in for a starting worker's process: what it writes, and how it ends."""
+
+    pid = 4242
+
+    def __init__(self, argv) -> None:
+        self.argv = argv
+        self.returncode = None
+        self.killed = False
+        self.stdin = io.StringIO()
+        self.stdout = self  # read by Worker._pump, line by line
+        self._lines: queue.Queue = queue.Queue()
+
+    def __iter__(self):
+        return iter(self._lines.get, None)
+
+    def close(self) -> None:
+        pass
+
+    def announce(self) -> None:
+        self._lines.put(json.dumps({"ready": self.pid}) + "\n")
+
+    def exit(self, code: int) -> None:
+        self.returncode = code
+        self._lines.put(None)
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired(self.argv, timeout)
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.killed = True
+        self.exit(-15)
+
+    kill = terminate
+
+
+class WorkerStart(unittest.TestCase):
+    """A starting worker is judged like a running one: slow while its CPU clock moves, hung when it stops.
+
+    The silence window is zero here, so every read of the frame channel that finds it
+    empty is a window that elapsed: the CPU readings the test hands out decide the start,
+    not the clock.
+    """
+
+    def start(self, cpu):
+        processes: list[_StartingProcess] = []
+
+        def popen(argv, **_kwargs):
+            processes.append(_StartingProcess(argv))
+            return processes[-1]
+
+        self.processes = processes
+        with mock.patch.object(pool_mod.subprocess, "Popen", popen), \
+                mock.patch.object(pool_mod, "SPAWN_TIMEOUT_SECONDS", 0.0), \
+                mock.patch.object(pool_mod, "process_cpu_seconds", cpu):
+            return pool_mod.Worker()
+
+    def test_a_start_whose_cpu_clock_moves_is_waited_for_until_it_announces(self):
+        # A loaded machine (or many workers starting at once) spreads the kernel import's
+        # few CPU seconds over minutes. A fixed wait killed such starts mid-import.
+        readings = itertools.count(1)
+
+        def cpu(pid):
+            reading = next(readings)
+            if reading == 3:
+                self.processes[0].announce()  # the import ends after three silent windows
+            return reading * 0.5
+
+        worker = self.start(cpu)
+        self.addCleanup(worker.kill)
+        self.assertEqual(worker.pid, _StartingProcess.pid)
+        self.assertFalse(self.processes[0].killed)
+
+    def test_a_start_whose_cpu_clock_stands_still_is_killed_and_says_so(self):
+        with self.assertRaises(pool_mod.WorkerGone) as caught:
+            self.start(lambda pid: pool_mod.BUSY_CPU_SECONDS / 2)
+        self.assertTrue(self.processes[0].killed)
+        self.assertIn("did not announce itself", str(caught.exception))
+        self.assertIn("no CPU progress", str(caught.exception))
+
+    def test_a_start_that_exits_says_how(self):
+        def cpu(pid):
+            raise AssertionError("an ended start was judged by its CPU clock")
+
+        def popen(argv, **_kwargs):
+            process = _StartingProcess(argv)
+            process.exit(3)
+            return process
+
+        with mock.patch.object(pool_mod.subprocess, "Popen", popen), \
+                mock.patch.object(pool_mod, "process_cpu_seconds", cpu), \
+                self.assertRaises(pool_mod.WorkerGone) as caught:
+            pool_mod.Worker()
+        self.assertEqual(caught.exception.exit_status, 3)
+        self.assertIn("exited with code 3 before announcing itself", str(caught.exception))
+
+    def test_a_worker_imports_nothing_from_the_folder_it_starts_in(self):
+        # Workers start in the system temp folder, which other programs fill. `python -m`
+        # puts its working directory first on the import path, so whatever is there
+        # shadowed the worker's own modules, and each import that missed it listed the
+        # whole folder again. Here that folder holds a `cadgen` of its own.
+        temporary = generated_cad_directory(prefix="daemon-worker-start-")
+        self.addCleanup(temporary.cleanup)
+        folder = pathlib.Path(temporary.name).resolve()
+        (folder / "cadgen").mkdir()
+        (folder / "cadgen" / "__init__.py").write_text(
+            "raise ImportError('imported from the folder the worker started in')\n", encoding="utf-8")
+        # The worker's own interpreter and flags in that folder, without the kernel import.
+        prelude = "from cadgen.daemon import worker\nworker._warm_imports = lambda: None\nraise SystemExit(worker.serve())\n"
+        real_popen = subprocess.Popen
+
+        def popen(argv, **kwargs):
+            self.assertEqual(argv[-2:], ["-m", "cadgen.daemon.worker"])
+            return real_popen([*argv[:-2], "-c", prelude], **{**kwargs, "cwd": str(folder)})
+
+        with mock.patch.object(pool_mod.subprocess, "Popen", popen):
+            worker = pool_mod.Worker()
+        self.addCleanup(worker.kill)
+        worker.send({"kind": "ping"})
+        self.assertEqual(list(worker.frames(silence_timeout=60)), [{"pong": worker.pid}])
+
+
+class InstallationGone(unittest.TestCase):
+    """What a worker starts from, removed under the daemon: a package manager replacing its environment."""
+
+    def test_an_installation_that_is_all_there_is_not_gone(self):
+        self.assertFalse(pool_mod.installation_gone())
+
+    def test_a_removed_interpreter_or_environment_is_gone(self):
+        temporary = generated_cad_directory(prefix="daemon-installation-")
+        self.addCleanup(temporary.cleanup)
+        environment = pathlib.Path(temporary.name).resolve()
+        with mock.patch.object(sys, "executable", str(environment / "python.exe")):
+            self.assertTrue(pool_mod.installation_gone())
+        # A virtual environment whose pyvenv.cfg went: on Windows its launcher exits 106 and starts nothing.
+        with mock.patch.object(sys, "prefix", str(environment)), \
+                mock.patch.object(sys, "base_prefix", str(environment / "base")):
+            self.assertTrue(pool_mod.installation_gone())
+            (environment / "pyvenv.cfg").write_text("home = elsewhere\n", encoding="utf-8")
+            self.assertFalse(pool_mod.installation_gone())
 
 
 class Status(_PoolFixture):

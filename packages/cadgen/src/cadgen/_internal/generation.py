@@ -1,90 +1,44 @@
 from __future__ import annotations
 
-import contextlib
-import importlib.util
+import copy
 import json
-import os
 import shutil
-import subprocess
 import sys
 import time
 
-from cadgen._internal.atomic_replace import replace_atomic, temp_suffix
-from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
-from typing import Iterator, Sequence, TextIO
+from typing import Sequence
 
 from cadgen.catalog import (
-    CadSource,
     StepImportOptions,
-    find_source_by_path,
-    iter_cad_sources,
-    normalize_cad_ref,
-    normalize_source_ref,
     source_from_path,
 )
 from cadgen.cli_logging import CliLogger
 from cadgen._internal.glb_topology import build_step_topology_index_manifest
-from cadgen._internal.glb_topology import (
-    STEP_EDGE_VISIBILITY_CLASSES,
-)
 from cadgen.coordination import (
     DRAWING_PACKAGE,
     PHASE_GENERATE,
     STEP_PACKAGE,
     ProgressEvent,
     artifact_build,
-    generator_busy,
-    render_progress_bar,
-    reporting_as,
     resolve as resolve_progress,
 )
-from cadgen.cli_progress import (
-    InlineProgressLine,
-    _finished_phase_text,
-    _progress_status_text,
-    cli_progress_line,
-)
-from cadgen.metadata import GeneratorMetadata
-from cadgen.render import (
-    relative_to_file,
-    relative_to_cwd,
-)
 from cadgen._internal.source_hash import (
-    PythonSourceClosure,
-    PythonSourceHash,
-    capture_runtime_closure,
-    closure_hash_matches,
-    evict_first_party_modules,
     python_source_hash,
-    record_first_party_execution,
 )
-from cadgen.step_export import build_build123d_step_scene
 from cadgen._internal.step_scene import (
     load_step_scene_cached,
     LoadedStepScene,
-    SelectorBundle,
     SelectorOptions,
     step_file_hash,
 )
 from cadgen._internal.generation_runner import (
-    GIT_LFS_POINTER_PREFIX,
     _ArtifactJob,
     _ensure_step_ready,
-    _generator_progress_line,
-    _load_generator_module,
     _mark_scene_python_backed,
-    _mark_scene_step_payload,
-    _normalize_step_payload,
-    _resolve_declared_kinematics,
     _run_artifact_jobs,
-    _run_script_generator_inner,
     _spec_output_dir,
-    _track_spec_generation,
-    _write_dxf_payload,
-    _write_shape_step_payload,
     run_script_generator,
 )
 from cadgen._internal.generation_spec import (
@@ -94,24 +48,125 @@ from cadgen._internal.generation_spec import (
     _cli_progress_line,
     _display_path,
     _entry_spec_from_source,
-    _hint_float,
-    _hint_int,
-    _resolve_discovery_root,
     _selector_options_for_part,
-    _spec_for_source_ref,
-    _spec_requests_extra_outputs,
-    list_entry_specs,
-    selected_entry_specs,
 )
+
+def _pinned_child_records(scene: object) -> Iterator[tuple[str, dict]]:
+    """Each child tree the body pinned, with that child's record, only while the
+    record still pins that exact tree: a child rebuilt since the parent called it
+    yields nothing, and the parent reads back or exports instead."""
+    from cadgen.store.records import read_record
+
+    for child in getattr(scene, "store_children", None) or ():
+        model, tree = child.get("model"), child.get("tree")
+        record = read_record(model) if model and tree else None
+        if record and record.get("tree") == tree:
+            yield str(tree), record
+
+
+def _pinned_child_documents(scene: object) -> dict[str, str]:
+    """Each pinned child tree mapped to the document tree its record pins, from
+    which the parent's read-back may be composed."""
+    return {tree: str(record["documentTree"])
+            for tree, record in _pinned_child_records(scene) if record.get("documentTree")}
+
+
+def _pinned_child_steps(scene: object) -> dict[str, object]:
+    """Each pinned child tree mapped to the saved STEP its record pins, from
+    which the parent may be spliced (``cadgen.store._splice_step``)."""
+    from cadgen.store._splice_step import ChildStep
+
+    steps: dict[str, object] = {}
+    for tree, record in _pinned_child_records(scene):
+        step_hash = str(record.get("stepHash") or "")
+        for path, entry in (record.get("outputs") or {}).items():
+            if (step_hash and Path(path).suffix.lower() in (".step", ".stp")
+                    and isinstance(entry, dict) and entry.get("sha256") == step_hash):
+                steps[tree] = ChildStep(Path(path), step_hash)
+                break
+    return steps
+
 
 def _sha256_of(path: Path) -> str:
     import hashlib
 
+    from cadgen._internal.atomic_replace import open_with_ladder
+
+    # Through the ladder: a peer build publishing the same model may be renaming
+    # over this very file, which Windows refuses an open for (STORE.md §7).
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with open_with_ladder(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_or_none(path: Path) -> str | None:
+    try:
+        return _sha256_of(path)
+    except FileNotFoundError:
+        return None
+
+
+def _document_pair_state(step_path: Path) -> tuple[str | None, str | None]:
+    """The saved STEP's and its sidecar's sha256, None for a file that is absent.
+
+    Through the gate's digest memo (``store.gate._sha256_file``), which one job
+    already consults for these very files: a file whose settled identity has
+    not moved since this process hashed it, or since it renamed its own written
+    copy into place, is not read again (STORE.md §4). A label edit keeps a STEP
+    of hundreds of megabytes, and used to read it once per call."""
+    from cadgen._internal.source_sidecar import source_sidecar_path
+    from cadgen.store.gate import _sha256_file
+
+    step = Path(step_path).expanduser().resolve()
+    return _sha256_file(step), _sha256_file(source_sidecar_path(step))
+
+
+def _publish_sidecar(staged_step: Path, entry_path: Path) -> None:
+    """Move the build's staged sidecar beside the saved STEP, or remove the saved
+    one when the build staged none. A saved sidecar that already has the staged
+    bytes stays in place, as a kept document does: a viewer versions the sidecar
+    by its file stamp, and a new stamp would reload the model for an edit that
+    changed nothing on screen, such as a label or a comment."""
+    from cadgen._internal.atomic_replace import replace_atomic
+    from cadgen._internal.source_sidecar import remove_source_sidecar, source_sidecar_path
+
+    staged, saved = source_sidecar_path(staged_step), source_sidecar_path(entry_path)
+    if not staged.is_file():
+        remove_source_sidecar(entry_path)
+    elif _sha256_or_none(saved) != _sha256_of(staged):
+        replace_atomic(staged, saved)
+
+
+def _kept_document(
+    spec: EntrySpec, writer_input: str, expected_pair: tuple[str | None, str | None] | None,
+) -> dict[str, object] | None:
+    """The saved document a rebuild keeps instead of writing the same bytes again.
+
+    Only when the model's record says its saved STEP was written from exactly
+    this writer input, the STEP on disk when the build started still has the
+    recorded bytes, and that document's canonical tree is complete in the
+    store. A record without ``writerInput`` keeps nothing.
+    """
+    from cadgen.store.records import read_record, tree_for_document_hash
+    from cadgen.store.trees import get_tree, tree_complete
+
+    record = read_record(_model_for_spec(spec)) or {}
+    step_hash = str(record.get("stepHash") or "")
+    document_tree = str(record.get("documentTree") or "")
+    if not step_hash or not document_tree or record.get("writerInput") != writer_input:
+        return None
+    if expected_pair is None or expected_pair[0] != step_hash:
+        return None
+    if tree_for_document_hash(step_hash) != document_tree or not tree_complete(document_tree):
+        return None
+    result = get_tree(str(record.get("tree") or "")) or {}
+    occurrence_map, node_map = record.get("documentOccurrenceMap"), record.get("documentNodeMap")
+    if not result.get("bbox") or not isinstance(occurrence_map, dict) or not occurrence_map or not isinstance(node_map, dict):
+        return None
+    return {"stepHash": step_hash, "documentTree": document_tree, "bbox": copy.deepcopy(result["bbox"]),
+            "documentOccurrenceMap": copy.deepcopy(occurrence_map), "documentNodeMap": copy.deepcopy(node_map)}
 
 
 def _edge_visibility_classes_match_manifest(
@@ -159,36 +214,12 @@ def _package_descriptor_matches_spec(
     spec: EntrySpec,
     selector_options: SelectorOptions | None = None,
 ) -> bool | None:
-    """assembly.json-based freshness for a view directory.
+    """Geometry-only currency, with source provenance for explicit builds.
 
-    Returns None when the entry's artifact is not a tree (caller falls back
-    to the monolith-GLB validator). Packages carry no embedded selector/edge
-    views (selector topology is extracted on demand), so routing them through
-    the monolith validator always failed and every build re-ran the generator plus
-    the full-scene mesh; validate against the assembly.json instead.
-
-    Content keying does most of the gating BY CONSTRUCTION: the tree key is
-    ``<sha256(document)>-v<schemaVersion>``, so a tree that resolves at all
-    has the right schema and belongs to exactly these bytes — the old
-    schema-version and stepHash gates all collapsed into the key. What
-    remains is what the key cannot answer: provenance direction (sidecar vs
-    spec), and — once a scene has been loaded and the caller can say what edge
-    classes it wants — whether the tree was built with those classes. The
-    source-closure gate stays the sanctioned asymmetry in the SAFE direction:
-    generated outputs are detached from their code, so the viewer never checks
-    source currency — here it survives purely as the explicit-build no-op
-    gate, where being stricter can only make a requested build do real work,
-    never trigger a needless one.
-
-    Without ``selector_options`` the caller cannot say what it wants, and
-    nothing can be inferred: the edge classes are a pure function of the STEP
-    bytes, which the key already pins, so re-deriving an expectation from the
-    assembly.json would only compare it against itself. All that is checkable
-    there is that the assembly.json IS one — that it records the classes at all.
-    The mesh comparison that used to live here weighed the assembly.json's
-    recorded deflection numbers against freshly resolved ones; no tessellator
-    ever read either, so the only thing a mismatch could trigger was a rebuild
-    that rewrote them.
+    The saved byte digest selects a complete native tree. Display derivatives
+    do not participate. Generated builds additionally check their provenance
+    and source closure; artifact readers never do. Edge visibility policy, when
+    explicitly requested, remains descriptor metadata rather than a mesh job.
     """
     from cadgen.catalog import result_descriptor_for
 
@@ -203,6 +234,11 @@ def _package_descriptor_matches_spec(
 
         provenance = read_source_provenance(spec.entry_path)
         if provenance is not None:
+            if provenance.get("kinematics"):
+                from cadgen._internal.source_sidecar import source_sidecar_matches_document
+
+                if not source_sidecar_matches_document(spec.entry_path):
+                    return False
             manifest["_sourceSidecar"] = provenance
     if not _artifact_source_kind_matches_spec(spec, manifest):
         return False
@@ -231,45 +267,29 @@ def _existing_topology_artifact_matches_options(spec: EntrySpec, selector_option
     return bool(_package_descriptor_matches_spec(spec, selector_options))
 
 
-def _assembly_provenance_manifest(
-    scene: LoadedStepScene,
-    *,
-    selector_options: SelectorOptions,
-    step_path: Path,
-) -> dict[str, object]:
-    """The index-manifest provenance an assembly.json carries, mirroring
-    the monolithic GLB's embedded STEP_topology index — but WITHOUT the expensive
-    selector extraction. Sourced from the scene (sourceKind/closure), the edge-render
-    options, and the STEP hash, so the build freshness gates can read it from
-    assembly.json exactly as they read the monolithic manifest.
+def _assembly_provenance_manifest(selector_options: SelectorOptions) -> dict[str, object]:
+    """The content-pure fields a generated tree carries: its edge capabilities
+    and the edge classes it was built with (``tree_extra`` below takes exactly
+    these two).
 
     There is no ``mesh`` section. A tree stores surfaces, not
     triangles; the client tessellates from ``.surf`` with the JS tessellator's
     own relative tolerances. The deflection numbers this block used to carry
     reached no mesher, and the adaptive ``resolution`` beside them was the
     INPUT to a decision whose output — ``edgeRendering.visibilityClasses`` — is
-    recorded right here.
+    recorded right here. No STEP hash either: nothing read it, and computing it
+    read the whole saved document once per build.
     """
-    import os
 
     from cadgen._internal.glb_topology import step_topology_capabilities
 
     # STEP-pure by contract: nothing here may derive from the Python source.
     # Source-derived state (provenance, pose, mates) rides the source sidecar
-    # (_source_sidecar_payload below) — the assembly.json is the cache engine's
-    # world and keys on the STEP bytes alone.
-    minimal: dict[str, object] = {
+    # (_source_sidecar_payload below) — the tree keys on geometry alone.
+    return build_step_topology_index_manifest({
         "capabilities": step_topology_capabilities(selector_options.edge_visibility_classes),
         "edgeRendering": {"visibilityClasses": list(selector_options.edge_visibility_classes)},
-    }
-    step_hash = (
-        step_file_hash(step_path)
-        if step_path.is_file()
-        else str(getattr(scene, "step_hash", "") or "").strip()
-    )
-    if step_hash:
-        minimal["stepHash"] = step_hash
-    return build_step_topology_index_manifest(minimal)
+    })
 
 
 def _source_sidecar_payload(scene: LoadedStepScene) -> dict[str, object] | None:
@@ -308,7 +328,9 @@ def _source_sidecar_payload(scene: LoadedStepScene) -> dict[str, object] | None:
         closure_files = getattr(scene, "source_closure_files", ()) or ()
         if closure_hash and closure_files:
             payload["sourceClosureHash"] = closure_hash
-            payload["sourceClosureFiles"] = list(closure_files)
+            from cadgen.store.closure import source_files
+
+            payload["sourceClosureFiles"] = source_files(closure_files)
     payload["generatedAt"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     return payload
 
@@ -322,11 +344,14 @@ def _generate_part_outputs(
     force: bool = False,
     logger: CliLogger | None = None,
     progress: object | None = None,
+    expected_document_pair: tuple[str | None, str | None] | None = None,
 ) -> GeneratedStepResult:
     logger = logger or CliLogger("cad")
     progress = resolve_progress(progress)
     if spec.step_path is None:
         return GeneratedStepResult(spec=spec, scene=None)
+    if expected_document_pair is None and spec.source == "generated":
+        expected_document_pair = _document_pair_state(spec.step_path)
     if require_step_file:
         _ensure_step_ready(spec.step_path)
     if preloaded_scene is not None:
@@ -335,22 +360,16 @@ def _generate_part_outputs(
                 f"Preloaded STEP scene path {preloaded_scene.step_path} does not match {_display_path(spec.step_path)}"
             )
 
-    # Any on-demand output (mesh sidecar or --step export) must be produced even when the
-    # tree is current, so its presence defeats the reuse fast paths.
-    has_extra_outputs = _spec_requests_extra_outputs(spec)
-    package_current = (
-        spec.source != "generated"
-        or _assembly_glb_package_current(spec)
-    )
     if (
         preloaded_scene is None
-        and not has_extra_outputs
+        and spec.source != "generated"
         and not force
-        and package_current
         and _existing_topology_artifact_matches_spec_without_scene(spec)
     ):
         logger.debug(f"reused current tree: {_display_path(spec.step_path)}")
-        return GeneratedStepResult(spec=spec, scene=None)
+        from cadgen.catalog import result_tree_for
+
+        return GeneratedStepResult(spec=spec, scene=None, tree=result_tree_for(spec.step_path))
 
     if preloaded_scene is not None:
         scene = preloaded_scene
@@ -373,16 +392,26 @@ def _generate_part_outputs(
         **entries_by_step_path,
         spec.step_path.resolve(): spec,
     }
-    selector_options = _selector_options_for_part(spec, scene=scene)
+    # Raw document compilation publishes the byte-derived canonical tree,
+    # whose edge classes are fixed by build_document_tree. Do not calculate
+    # generated-source metadata that this path never consumes. Re-emits and
+    # Python-backed scenes retain their ordinary preparation path.
+    raw_document = (
+        spec.source != "generated"
+        and str(getattr(scene, "source_kind", "step") or "step").strip().lower() != "python"
+        and not str(getattr(scene, "reemit_source_hash", "") or "").strip()
+    )
+    selector_options = _selector_options_for_part(spec, scene=None if raw_document else scene)
     if (
-        not has_extra_outputs
+        spec.source != "generated"
         and not force
-        and package_current
         and _existing_topology_artifact_matches_options(spec, selector_options)
         and _generated_assembly_glb_closure_current(spec)
     ):
         logger.debug(f"reused current tree: {_display_path(spec.step_path)}")
-        return GeneratedStepResult(spec=spec, scene=scene)
+        from cadgen.catalog import result_tree_for
+
+        return GeneratedStepResult(spec=spec, scene=scene, tree=result_tree_for(spec.step_path))
 
     jobs: list[_ArtifactJob] = []
 
@@ -395,16 +424,23 @@ def _generate_part_outputs(
     # else is one component. No declaration steers it and nothing is inferred from
     # source — the tree's entryKind is read off the tree once built.
     source_compound = getattr(scene, "source_compound", None)
-    package_provenance = _assembly_provenance_manifest(
-        scene, selector_options=selector_options, step_path=spec.step_path
-    )
+    package_provenance = {} if raw_document else _assembly_provenance_manifest(selector_options)
+    if getattr(scene, "disposable_prototypes", False):
+        # The reference scene's decoded prototypes have classified the topology
+        # (the edge policy above); everything after this reads geometry from
+        # the pinned trees. Drop them now rather than carry a second complete
+        # native copy of a large assembly through its export and read-back.
+        scene.prototype_shapes = {}
+        scene.prototype_face_colors = {}
 
     def component_package_job() -> dict[str, object]:
+        from pathlib import Path
+
         shape = source_compound
-        if shape is None:
-            # Imported STEP (no generator compound): compose the ALREADY-LOADED scene
-            # into the packaging compound. This used to call build123d.import_step and
-            # pay a second full text-STEP parse right after the scene load above.
+        if shape is None and not raw_document:
+            # Generated/re-emitted scenes without an authored compound need
+            # this wrapper. Raw documents go directly to build_document_tree;
+            # constructing the same hierarchy here would be discarded.
             from cadgen._internal.step_scene_mesh import scene_to_build123d_compound
 
             shape = scene_to_build123d_compound(scene)
@@ -423,17 +459,97 @@ def _generate_part_outputs(
             for key in ("capabilities", "edgeRendering")
             if key in package_provenance
         }
+        from cadgen.daemon import executors
+        from cadgen.store.surfaces import producer_identity
+
+        # The worker can attest its actual display producer without deriving
+        # SURF. Unknown display capability never prevents native publication.
+        try:
+            surface_producer = producer_identity()
+        except ValueError:
+            surface_producer = None
+
+        def tree_kinematics(result_hash: str):
+            declaration = getattr(scene, "kinematics", None)
+            if not declaration:
+                return None
+            from cadgen._internal.kinematics_resolve import resolve_kinematics_block
+
+            # Mates resolve against the result's occurrences and labels; only an
+            # axis ref reads a component's topology, and only its own.
+            with logger.timed("tree: kinematics"):
+                resolved, _ = resolve_kinematics_block(
+                    declaration, tree_hash=result_hash, source_ref=str(spec.source_ref),
+                    producer=surface_producer,
+                )
+            return resolved
+
+        def publish_preview(result_hash: str, _tree: dict):
+            if spec.source == "generated":
+                executors.emit_source_result(_model_for_spec(spec), result_hash)
+            # The role, output path and progress belong to this request, never
+            # in the content-addressed tree or the saved document's index. A
+            # build's status names its output and result and nothing else: its
+            # readers take neither geometry nor annotations from it (STORE.md §9b).
+            if writes_step and executors.sink_installed():
+                executors.emit_event(executors.model_event(
+                    _model_for_spec(spec), "building", phase="Saving STEP",
+                    preview={"output": str(spec.step_path.expanduser().resolve()), "tree": result_hash},
+                ))
+            wait_children = getattr(scene, "wait_child_outputs", None)
+            if wait_children is not None:
+                wait_children()
         # Objects first: components + tree. Harmless if this build ends up not
         # publishing its record (publish rule below) — content-addressed and GC'd.
-        with logger.timed("tree: components"):
-            tree_hash, tree, stats = build_tree_from_compound(
-                shape,
-                root_name=spec.step_path.stem,
-                force=force,
-                progress=progress,
-                extra=tree_extra,
-            )
+        writes_step = generated and bool(spec.step_output)
+        exported_hash: str | None = None
+        staged_step: Path | None = None
+        if writes_step:
+            # Publish the final authored result, then write and validate a
+            # separate byte-derived saved document tree.
+            from cadgen._internal.atomic_replace import STAGE_PREFIX
+            from cadgen.store.build import build_tree_through_step
+            from tempfile import TemporaryDirectory
+
+            spec.step_path.parent.mkdir(parents=True, exist_ok=True)
+            # The private document retains its final basename, so STEP labels
+            # and byte canonicalization do not depend on the temporary directory.
+            # Publication owns the final rename after validation and the gate.
+            stage = publication_cleanup.enter_context(TemporaryDirectory(
+                prefix=f"{STAGE_PREFIX}{spec.step_path.stem}-", dir=spec.step_path.parent
+            ))
+            staged_step = Path(stage) / spec.step_path.name
+            with logger.timed("tree: components"):
+                tree_hash, tree, stats, exported_hash = build_tree_through_step(
+                    shape,
+                    staged_step,
+                    root_name=spec.step_path.stem,
+                    force=force,
+                    progress=progress,
+                    extra=tree_extra,
+                    logger=logger,
+                    on_preview=publish_preview,
+                    _internal_source_publication=True,
+                    materials=getattr(scene, "materials", None),
+                    child_documents=lambda: _pinned_child_documents(scene),
+                    child_steps=lambda: _pinned_child_steps(scene),
+                    kept_document=lambda digest: _kept_document(spec, digest, expected_document_pair),
+                )
+        else:
+            with logger.timed("tree: components"):
+                if not generated:
+                    from cadgen.store.build import build_document_tree
+
+                    tree_hash, tree, stats = build_document_tree(scene, force=force, progress=progress)
+                else:
+                    tree_hash, tree, stats = build_tree_from_compound(
+                        shape, root_name=spec.step_path.stem, force=force,
+                        progress=progress, extra=tree_extra,
+                        materials=getattr(scene, "materials", None),
+                    )
+                    publish_preview(tree_hash, tree)
         stats["tree"] = tree_hash
+        document_tree_hash = str(stats.get("documentTree") or tree_hash)
 
         model_path = _model_for_spec(spec)
         outputs: dict[str, object] = {}
@@ -441,60 +557,44 @@ def _generate_part_outputs(
         if generated:
             kinematics_block = getattr(scene, "kinematics", None)
             if kinematics_block:
-                # Axis refs resolve against a VIEW (assembly.json + components/) of the tree (the
-                # same composed selector index inspect uses). Nothing here moves
-                # geometry: the tree is the result exactly as the model returned it.
-                from cadgen._internal.kinematics_resolve import resolve_kinematics_block
-                from cadgen.store.view import export_view
+                sidecar_payload["kinematics"] = tree_kinematics(tree_hash)
+                if writes_step:
+                    from cadgen._internal.kinematics_resolve import remap_document_kinematics
 
-                view_dir = export_view(tree_hash)
-                try:
-                    with logger.timed("tree: kinematics"):
-                        resolved_block, occurrence_ids = resolve_kinematics_block(
-                            kinematics_block,
-                            package_dir=view_dir,
-                            step_path=spec.step_path,
-                            source_ref=str(spec.source_ref),
-                        )
-                finally:
-                    shutil.rmtree(view_dir, ignore_errors=True)
-                sidecar_payload["kinematics"] = resolved_block
-            if spec.step_output:
-                write_source_sidecar(spec.entry_path, sidecar_payload)
-
-                from cadgen.store.materialize import materialize
-                from cadgen.step_export import export_build123d_step_file
-
-                spec.step_path.parent.mkdir(parents=True, exist_ok=True)
-                with logger.timed("tree: assemble STEP"):
-                    exported_hash = export_build123d_step_file(
-                        materialize(tree_hash, label=spec.step_path.stem), spec.step_path, logger=logger
+                    sidecar_payload["kinematics"] = remap_document_kinematics(
+                        sidecar_payload["kinematics"], stats["documentOccurrenceMap"],
+                        stats["documentNodeMap"], document_tree_hash,
                     )
-                from cadgen.catalog import seed_artifact_hash
+            if spec.step_output:
+                assert staged_step is not None
+                appearance = tree.get("appearance")
+                if appearance is not None:
+                    from cadgen._internal.source_sidecar import remap_appearance
 
-                seed_artifact_hash(spec.step_path, exported_hash)
-                hashes = getattr(scene, "exported_step_sha256", None) or {}
-                hashes[str(spec.step_path.expanduser().resolve())] = exported_hash
-                scene.exported_step_sha256 = hashes
+                    sidecar_payload["appearance"] = remap_appearance(
+                        appearance, stats["documentOccurrenceMap"]
+                    )
+                animation = getattr(scene, "animation", None)
+                if animation is not None:
+                    sidecar_payload["animation"] = copy.deepcopy(animation)
+                write_source_sidecar(staged_step, sidecar_payload, document_hash=exported_hash)
+                assert exported_hash is not None  # written by build_tree_through_step above
                 outputs[str(spec.step_path.expanduser().resolve())] = {"sha256": exported_hash}
                 from cadgen._internal.source_sidecar import source_sidecar_path
 
-                sidecar_file = source_sidecar_path(spec.entry_path)
+                sidecar_file = source_sidecar_path(staged_step)
                 if sidecar_file.is_file():
-                    outputs[str(sidecar_file.resolve())] = {"sha256": _sha256_of(sidecar_file)}
-            else:
-                # A mesh-only model: the tree and record are the model's like any
-                # other; its outputs are the declared meshes, produced from the tree
-                # below. No STEP, no sidecar -- STEP is one output kind, not the primary.
-                remove_source_sidecar(spec.entry_path)
-        else:
-            # Imported document: the source IS the file; no sidecar, no generated marker.
-            remove_source_sidecar(spec.entry_path)
+                    outputs[str(source_sidecar_path(spec.entry_path).resolve())] = {"sha256": _sha256_of(sidecar_file)}
+        # An imported document and anything beside it are authored inputs. Cache
+        # publication must not add, rewrite, or remove either one.
 
         # The record. Publish rule: never replace a current record with a stale one.
         closure_hash = str(getattr(scene, "source_closure_hash", "") or "")
         closure_files = list(getattr(scene, "source_closure_files", ()) or ())
         closure_shas = dict(getattr(scene, "source_closure_file_hashes", None) or {})
+        closure_names = {rel: list(names) for rel, names in (getattr(scene, "source_closure_names", None) or {}).items()}
+        closure_wholes = dict(getattr(scene, "source_closure_wholes", None) or {})
+        closure_own = {rel: list(names) for rel, names in (getattr(scene, "source_closure_own", None) or {}).items()}
         closure_static = False
         reemit_source_hash = getattr(scene, "reemit_source_hash", None)
         if not generated:
@@ -504,6 +604,7 @@ def _generate_part_outputs(
             step_hash = str(getattr(scene, "step_hash", "") or "") or step_file_hash(spec.step_path)
             closure_files = [spec.step_path.name]
             closure_shas = {spec.step_path.name: step_hash}
+            closure_names, closure_wholes, closure_own = {}, {}, {}
             closure_hash = _closure_hash([(spec.step_path.name, step_hash)])
         elif reemit_source_hash and not closure_hash:
             # A re-emitted document (`cadgen step build IN OUT`): its source is
@@ -512,6 +613,7 @@ def _generate_part_outputs(
             from cadgen.store.closure import closure_hash as _closure_hash
 
             closure_files = []
+            closure_names, closure_wholes, closure_own = {}, {}, {}
             closure_hash = _closure_hash(
                 [("reemit", str(reemit_source_hash)), ("annotation", str(getattr(scene, "reemit_annotation_hash", "") or ""))]
             )
@@ -519,7 +621,9 @@ def _generate_part_outputs(
         # Declared mesh exports recorded by earlier runs stay listed: each one
         # carries the document hash it was cut from, so the mesh gate re-checks
         # it against THIS document and re-exports only what no longer matches.
-        previous = read_record(model_path) or {}
+        # A foreign compile derives its result from document bytes alone.
+        # Only generated jobs retain declarations from an earlier model run.
+        previous = (read_record(model_path) or {}) if generated else {}
         for output_path, entry in (previous.get("outputs") or {}).items():
             if isinstance(entry, dict) and entry.get("declared") and output_path not in outputs:
                 outputs[output_path] = entry
@@ -537,10 +641,17 @@ def _generate_part_outputs(
             "entryKind": tree_kind(tree),
             "sourceKind": "step" if (not generated or reemit_source_hash) else "python",
             "tree": tree_hash,
-            "closure": {"hash": closure_hash, "files": closure_files, "shas": closure_shas, "static": closure_static},
+            "unannotatedTree": str(stats.get("unannotatedTree") or tree_hash),
+            "documentTree": document_tree_hash if spec.step_output else None,
+            "closure": {"hash": closure_hash, "files": closure_files, "shas": closure_shas, "names": closure_names,
+                        "wholes": closure_wholes, "own": closure_own, "static": closure_static},
             # Literals imported from model files, tracked by VALUE (gate clause 2).
             "constants": dict(getattr(scene, "source_closure_constants", None) or {}) if generated else {},
             "children": list(getattr(scene, "store_children", None) or []),
+            "documentOccurrenceMap": copy.deepcopy(stats.get("documentOccurrenceMap") or {}),
+            "documentNodeMap": copy.deepcopy(stats.get("documentNodeMap") or {}),
+            # What the saved STEP's bytes are a function of (store.build.writer_input_digest).
+            "writerInput": stats.get("writerInput") if writes_step else None,
             "outputs": outputs,
             # The bytes of the document this tree describes -- a door's one question
             # (cadgen._internal.doors.document_tree). An imported document is hashed
@@ -555,63 +666,125 @@ def _generate_part_outputs(
                 )
             ),
         }
+        from cadgen.store.trees import get_tree
+
+        unannotated = get_tree(str(record["unannotatedTree"]))
+        intrinsic_appearance = (unannotated or {}).get("appearance")
+        if intrinsic_appearance is not None and stats.get("documentOccurrenceMap"):
+            from cadgen._internal.source_sidecar import remap_appearance
+
+            intrinsic_appearance = remap_appearance(
+                intrinsic_appearance, stats["documentOccurrenceMap"]
+            )
+        if intrinsic_appearance is not None:
+            record["intrinsicAppearance"] = copy.deepcopy(intrinsic_appearance)
         if reemit_source_hash:
             record["sourceHash"] = str(reemit_source_hash)
             record["annotationHash"] = str(getattr(scene, "reemit_annotation_hash", "") or "")
+            record["inputAppearance"] = str(getattr(scene, "reemit_appearance_hash", "") or "")
         if generated and sidecar_payload is not None and sidecar_payload.get("kinematics") is not None:
             record["kinematics"] = sidecar_payload.get("kinematics")
         if generated:
-            from cadgen.store.publish import decide
+            if getattr(scene, "materials", None) is not None:
+                record["materials"] = copy.deepcopy(scene.materials)
+            if getattr(scene, "animation", None) is not None:
+                record["animation"] = copy.deepcopy(scene.animation)
+            if sidecar_payload is not None and sidecar_payload.get("appearance") is not None:
+                record["appearance"] = copy.deepcopy(sidecar_payload["appearance"])
+        if record["sourceKind"] == "python" and spec.script_path is not None:
+            from cadgen._internal.annotation_refresh import capture_geometry_closure
 
-            decision = decide(model_path, ran_closure_hash=closure_hash, ran_files=closure_files)
-            if not decision.publish_outputs:
-                logger.info(f"{spec.cad_ref}: {decision.reason}; objects kept, record left as is")
-                stats["published"] = False
-                return stats
-        write_record(model_path, record)
+            entry_name = getattr(spec.generator_metadata, "entry_function", None)
+            if entry_name:
+                geometry_closure = capture_geometry_closure(
+                    spec.script_path, record["closure"], entry_name=entry_name
+                )
+                if geometry_closure is not None:
+                    record["geometryClosure"] = geometry_closure
+        if generated:
+            from cadgen.store.publish import decide
+            from cadgen.store.trees import claim_tree
+
+            # Claimed, not just checked: the record below names these closures,
+            # so no sweep may take any part of them from here on (STORE.md §8).
+            if not claim_tree(tree_hash) or (writes_step and not claim_tree(document_tree_hash)):
+                raise RuntimeError(f"{spec.cad_ref}: result was not saved: pinned geometry disappeared from the cache during the build")
+            # A re-emitted STEP has an immutable byte/annotation input closure,
+            # not a Python source closure that current_closure_hash can read.
+            if not closure_static:
+                decision = decide(model_path, ran_closure_hash=closure_hash, ran_files=closure_files, ran_names=closure_names,
+                                  ran_shas=closure_shas, ran_wholes=closure_wholes, ran_own=closure_own)
+                if not decision.publish_outputs:
+                    raise RuntimeError(f"{spec.cad_ref}: result was not saved: {decision.reason}")
+            if staged_step is not None and expected_document_pair is not None:
+                current_pair = _document_pair_state(spec.step_path)
+                from cadgen._internal.source_sidecar import source_sidecar_path
+
+                candidate_pair = (exported_hash, outputs.get(str(source_sidecar_path(spec.entry_path).resolve()), {}).get("sha256"))
+                if current_pair != expected_document_pair and current_pair != candidate_pair:
+                    raise RuntimeError(f"{spec.cad_ref}: result was not saved: the STEP file or its annotations changed during the build")
         from cadgen.store.records import note_document_tree, note_output
 
         # Artifact side: the bytes of the document this tree describes → the tree
         # (a reader's one lookup; STORE.md §2). Code side: which model wrote each
         # output path (the badge's question, never a reader's).
-        if tree_hash and record.get("stepHash"):
-            note_document_tree(str(record["stepHash"]), str(tree_hash))
+        if document_tree_hash and record.get("stepHash"):
+            note_document_tree(str(record["stepHash"]), document_tree_hash, surface_producer=surface_producer)
         if generated:
+            if staged_step is not None:
+                from cadgen.catalog import seed_artifact_hash
+                from cadgen._internal.atomic_replace import replace_atomic
+                from cadgen._internal.source_sidecar import source_sidecar_path
+
+                # Separate atomic writes, not a multi-file transaction. The
+                # artifact index already describes the validated staged bytes;
+                # saved readers can recover from a missing cache by those bytes.
+                # A kept document is already in place, byte for byte.
+                if not stats.get("documentKept"):
+                    from cadgen.store.gate import file_stamp, remember_renamed_digest
+
+                    # The written copy's identity survives the rename, so its
+                    # digest needs no second read of the saved document.
+                    staged_identity = file_stamp(staged_step)
+                    replace_atomic(staged_step, spec.step_path)
+                    remember_renamed_digest(spec.step_path.expanduser().resolve(), exported_hash, staged_identity)
+                _publish_sidecar(staged_step, spec.entry_path)
+                actual_pair = _document_pair_state(spec.step_path)
+                expected_sidecar = outputs.get(str(source_sidecar_path(spec.entry_path).resolve()), {}).get("sha256")
+                if actual_pair != (exported_hash, expected_sidecar):
+                    raise RuntimeError(f"{spec.cad_ref}: saved files changed during publication; the build record was not updated")
+                seed_artifact_hash(spec.step_path, exported_hash)
+                hashes = getattr(scene, "exported_step_sha256", None) or {}
+                hashes[str(spec.step_path.expanduser().resolve())] = exported_hash
+                scene.exported_step_sha256 = hashes
+            else:
+                # Mesh-only models have no STEP or kinematics sidecar.
+                remove_source_sidecar(spec.entry_path)
             for output_path in outputs:
                 note_output(output_path, model_path)
+        write_record(model_path, record)
+        if staged_step is not None:
+            executors.emit_event(executors.model_event(
+                model_path, "building", phase="STEP saved",
+                saved={"output": str(spec.step_path.expanduser().resolve()),
+                       "tree": document_tree_hash, "documentHash": exported_hash},
+            ))
         stats["published"] = True
         return stats
 
     jobs.append(_ArtifactJob("tree", component_package_job))
 
-    if spec.step_export_path is not None:
-        def step_export_job() -> Path:
-            # The STEP file is ASSEMBLED from the tree's exact-shape component objects
-            # (design/step-document-architecture.md) — a save, not a
-            # recompute — so this job runs after the tree job. Imported
-            # sources already have the file; copy when a different path was
-            # requested.
-            target = spec.step_export_path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            # The tree job already wrote the generated document to
-            # spec.step_path (the store key derives from those bytes); an
-            # explicit target elsewhere is a byte copy of the same document.
-            if spec.step_path is not None and spec.step_path.is_file() and spec.step_path.resolve() != target.resolve():
-                shutil.copyfile(spec.step_path, target)
-                hashes = getattr(scene, "exported_step_sha256", None) or {}
-                recorded = hashes.get(str(spec.step_path.expanduser().resolve()))
-                if recorded:
-                    hashes[str(target.expanduser().resolve())] = recorded
-                    scene.exported_step_sha256 = hashes
-            return target
+    from contextlib import ExitStack
 
-        jobs.append(_ArtifactJob("STEP", step_export_job))
-
-    artifact_results.update(_run_artifact_jobs(jobs, logger=logger))
+    with ExitStack() as publication_cleanup:
+        artifact_results.update(_run_artifact_jobs(jobs, logger=logger))
     # The render artifact is the tree; whole-model selector topology is
-    # extracted on demand by ensure_step_topology_artifact (inspect/selection renders), so
-    # generation no longer returns a selector bundle.
-    return GeneratedStepResult(spec=spec, scene=scene, selector_bundle=None)
+    # extracted on demand by ensure_step_topology_artifact (selection renders,
+    # read_scene), so generation returns no selector bundle.
+    tree_result = artifact_results.get("tree") or {}
+    return GeneratedStepResult(spec=spec, scene=scene, selector_bundle=None,
+                               tree=str(tree_result.get("tree") or "") or None,
+                               step_kept=bool(tree_result.get("documentKept")))
 
 
 def _generate_step_outputs(
@@ -621,29 +794,46 @@ def _generate_step_outputs(
     force: bool = False,
     logger: CliLogger | None = None,
     progress: object | None = None,
+    verdict: object | None = None,
 ) -> GeneratedStepResult:
+    """``verdict`` is the gate's verdict this job already took for ``spec``
+    (``generate_step_targets``); without one the gate is asked here."""
     preloaded_scene: LoadedStepScene | None = None
-    # An on-demand output (mesh sidecar or --step export) must run even when the tree is
-    # current, so its presence defeats the reuse fast path.
-    has_extra_outputs = _spec_requests_extra_outputs(spec)
+    if not force and spec.source == "generated" and verdict is None:
+        verdict = _gate_verdict(spec)
+    if not force and spec.source == "generated":
+        from cadgen._internal.annotation_refresh import refresh_annotations
+
+        refreshed_tree = refresh_annotations(spec, verdict=verdict)
+        if refreshed_tree is not None:
+            _current_source_result(spec, refreshed_tree)
+            _produce_declared_mesh_exports(spec, logger=logger, source_tree=refreshed_tree)
+            return GeneratedStepResult(spec=spec, scene=None, tree=refreshed_tree)
+    reuse_tree = _checked_source_tree(spec, verdict) if not force else None
     # Reuse fast path: skip the build when the tree is already present and
     # current and nothing forces a run. A generated model's freshness rides on its recorded
     # source closure; an imported/committed STEP's freshness rides on the STEP hash recorded in
     # the tree (verified inside the artifact-matches gate), so it needs no closure check.
-    if (
-        not force
-        and not has_extra_outputs
-        and _assembly_glb_package_current(spec)
-        and _existing_topology_artifact_matches_spec_without_scene(spec)
-        and (spec.source != "generated" or _generated_assembly_glb_closure_current(spec))
+    # A stale verdict settles it before the descriptor check, which hashes the saved
+    # document (and, for a model with kinematics, its sidecar's binding to it).
+    if not force and (
+        (reuse_tree is not None and _existing_topology_artifact_matches_spec_without_scene(spec))
+        if spec.source == "generated"
+        else (_existing_topology_artifact_matches_spec_without_scene(spec) and _assembly_glb_package_current(spec))
     ):
         if logger is not None:
             logger.debug(f"reused current tree: {_display_path(spec.step_path)}")
         # Declared mesh exports are content-gated, not build-gated: a current
         # model with a deleted/stale STL heals it here from the store package
         # without a rebuild.
-        _produce_declared_mesh_exports(spec, logger=logger)
-        return GeneratedStepResult(spec=spec, scene=None)
+        if spec.source == "generated":
+            _current_source_result(spec, reuse_tree)
+        else:
+            from cadgen.catalog import result_tree_for
+
+            reuse_tree = result_tree_for(spec.step_path)
+        _produce_declared_mesh_exports(spec, logger=logger, source_tree=reuse_tree)
+        return GeneratedStepResult(spec=spec, scene=None, tree=reuse_tree)
     output_kwargs: dict[str, object] = {
         "entries_by_step_path": entries_by_step_path,
         "force": force,
@@ -652,6 +842,8 @@ def _generate_step_outputs(
     if logger is not None:
         output_kwargs["logger"] = logger
     if spec.source == "generated":
+        if spec.step_path is not None:
+            output_kwargs["expected_document_pair"] = _document_pair_state(spec.step_path)
         preloaded_scene = run_script_generator(
             spec,
             "step",
@@ -661,6 +853,7 @@ def _generate_step_outputs(
             # The direct build flow: the model's own prints are the user's
             # stdout channel here (and pinned by test).
             model_prints_to_stdout=True,
+            _defer_reference_scene=True,
         )
         if spec.step_path is not None:
             output_kwargs["entries_by_step_path"] = {
@@ -677,39 +870,32 @@ def _generate_step_outputs(
         # returned None — no package written — while the CLI still reported success.
         output_kwargs["require_step_file"] = True
     result = _generate_part_outputs(spec, **output_kwargs)
-    _record_step_export(spec, scene=preloaded_scene)
-    _produce_declared_mesh_exports(spec, logger=logger)
+    _produce_declared_mesh_exports(spec, logger=logger, source_tree=result.tree)
     return result
 
 
 def _produce_declared_mesh_exports(
-    spec: EntrySpec, *, logger: CliLogger | None, announce: bool = True
+    spec: EntrySpec, *, logger: CliLogger | None, source_tree: str | None = None
 ) -> "tuple[Path, ...]":
     """Produce the model's declared ``@stl``/``@glb``/``@threemf`` outputs and
-    RETURN the ones this call actually wrote.
-
-    The return value is what ``BuildResult.exports`` reports: outputs the
-    ledger already found current are not listed, because the field answers
-    "what did this run write", not "what does the model declare".
+    RETURN the ones this call actually wrote (outputs the ledger already found
+    current are not listed).
 
     Runs through the ONE mesh engine the `cadgen stl|3mf|glb build` doors use — same Node
     invocation, same records — so the two front doors cannot drift. Each
-    output is gated by its content-keyed record (document hash + effective
-    tolerances): current outputs cost a stat + record read; stale or missing
-    ones tessellate from the store package. Content-gated deliberately even
-    under --force: a byte-identical rebuild leaves exports byte-identical by
-    determinism, so rewriting them is pure waste.
+    output is gated by its content-keyed record (document hash + the tolerance
+    pair the file on disk was ACTUALLY written at): current outputs cost a stat +
+    record read; stale or missing ones tessellate from the store package.
+    Content-gated deliberately even under --force: a byte-identical rebuild
+    leaves exports byte-identical by determinism, so rewriting them is pure waste.
 
-    Tolerance precedence: declaration-level explicit > @step model-level
-    explicit > tessellator default (matching the CLI's flag > model > default).
-
-    ``announce`` prints the ``wrote <FMT>: <path>`` lines. A caller that
-    renders the produced paths itself — a generated CLI printing its Result —
-    passes False so the same file is not reported twice.
+    Tolerance precedence: run-level flag > declaration > @step model-level >
+    tessellator default. The flag is folded into ``spec.mesh_exports`` (and the
+    model-level value) by ``_apply_step_options_to_spec`` before this runs, so
+    "declaration, else model" below already honours it.
     """
     if not spec.mesh_exports or spec.entry_path is None or spec.step_path is None:
         return ()
-    from cadgen.catalog import artifact_file_hash
     from cadgen._internal.mesh_export import (
         MeshExportJob,
         mesh_export_current,
@@ -717,22 +903,29 @@ def _produce_declared_mesh_exports(
         run_mesh_exporter,
     )
 
-    from cadgen.catalog import result_tree_for
     from cadgen.store.view import export_view
 
     model = _model_for_spec(spec)
     if spec.step_output:
-        document_hash = artifact_file_hash(spec.entry_path)
-        tree_hash = result_tree_for(spec.entry_path)
+        from cadgen._internal.doors import document_snapshot
+
+        document_hash, tree_hash = document_snapshot(spec.entry_path)
     else:
         # A mesh-only model writes no document: its tree IS the geometry the
         # meshes are cut from, so the ledger keys on that.
-        from cadgen.store.records import current_tree
+        tree_hash = source_tree
+        if tree_hash is None:
+            from cadgen.store.records import current_tree
 
-        tree_hash = current_tree(model) if model is not None else None
+            tree_hash = current_tree(model) if model is not None else None
         document_hash = tree_hash
     if document_hash is None or tree_hash is None or model is None:
         return ()
+    from cadgen._internal.source_sidecar import appearance_digest, read_source_sidecar
+
+    sidecar = read_source_sidecar(spec.entry_path, document_hash=document_hash) if spec.step_output else None
+    appearance = (sidecar or {}).get("appearance")
+    appearance_key = appearance_digest(appearance)
     pending: list[MeshExportJob] = []
     for declared in spec.mesh_exports:
         chord = declared.mesh_tolerance if declared.mesh_tolerance is not None else spec.mesh_tolerance
@@ -747,6 +940,7 @@ def _produce_declared_mesh_exports(
             document_hash=document_hash,
             mesh_tolerance=chord,
             mesh_angular_tolerance=angle,
+            appearance_key=appearance_key,
         ):
             continue
         declared.path.parent.mkdir(parents=True, exist_ok=True)
@@ -773,6 +967,7 @@ def _produce_declared_mesh_exports(
             name=spec.step_path.stem,
             default_color=_color_hex(spec.color),
             logger=logger if logger is not None else CliLogger("cadgen", verbose=False),
+            appearance=appearance,
         )
     finally:
         shutil.rmtree(view_dir, ignore_errors=True)
@@ -784,58 +979,12 @@ def _produce_declared_mesh_exports(
             fmt=job.fmt,
             mesh_tolerance=job.mesh_tolerance,
             mesh_angular_tolerance=job.mesh_angular_tolerance,
+            appearance_key=appearance_key,
         )
-        if announce:
-            # stderr: stdout is the result channel (`outcome document`), and a
-            # `[cadgen]`-prefixed line is the logger's voice, not a result.
-            print(f"[cadgen] wrote {job.fmt.upper()}: {_display_path(job.out)}", file=sys.stderr)
+        # stderr: stdout is the result channel (`outcome document`), and a
+        # `[cadgen]`-prefixed line is the logger's voice, not a result.
+        print(f"[cadgen] wrote {job.fmt.upper()}: {_display_path(job.out)}", file=sys.stderr)
     return tuple(job.out for job in jobs)
-
-
-def _record_step_export(spec: EntrySpec, scene: object | None = None) -> None:
-    """After a ``--write`` to an explicit target, list that file among the
-    MODEL's outputs (record clause 5). Best-effort."""
-    target = spec.step_export_path
-    model = _model_for_spec(spec)
-    if target is None or model is None:
-        return
-    try:
-        from cadgen.store.records import read_record, write_record
-
-        resolved = target.expanduser().resolve()
-        record = read_record(model)
-        if record is None or not resolved.is_file():
-            return
-        digest = (getattr(scene, "exported_step_sha256", None) or {}).get(str(resolved)) or _sha256_of(resolved)
-        outputs = dict(record.get("outputs") or {})
-        outputs[str(resolved)] = {"sha256": digest, "declared": "step"}
-        record["outputs"] = outputs
-        write_record(model, record)
-    except Exception:
-        pass
-
-
-def _step_export_current(spec: EntrySpec) -> bool:
-    """Whether the requested ``--write`` output is listed in the model's current
-    record and its bytes verify."""
-    target = spec.step_export_path
-    if target is None:
-        return True
-    model = _model_for_spec(spec)
-    if model is None:
-        return False
-    try:
-        from cadgen.store.gate import stale
-        from cadgen.store.records import read_record
-
-        if stale(model).stale:
-            return False
-        record = read_record(model) or {}
-        resolved = target.expanduser().resolve()
-        entry = (record.get("outputs") or {}).get(str(resolved))
-        return bool(entry) and resolved.is_file() and _sha256_of(resolved) == entry.get("sha256")
-    except Exception:
-        return False
 
 
 def _generate_step_outputs_for_cli(
@@ -845,11 +994,14 @@ def _generate_step_outputs_for_cli(
     logger: CliLogger,
     force: bool = False,
     progress: object | None = None,
+    verdict: object | None = None,
 ) -> GeneratedStepResult:
     kwargs: dict[str, object] = {
         "entries_by_step_path": entries_by_step_path,
         "progress": progress,
     }
+    if verdict is not None:
+        kwargs["verdict"] = verdict
     if force:
         kwargs["force"] = True
     if logger.verbose:
@@ -889,20 +1041,14 @@ def _selected_specs_for_targets(
         explicit_specs.append(_apply_step_options_to_spec(_entry_spec_from_source(source), step_options))
 
     if not unresolved_targets:
-        return _expand_specs_with_file_dependencies(explicit_specs), explicit_specs
+        return list(explicit_specs), explicit_specs
 
     unresolved = ", ".join(unresolved_targets)
     raise FileNotFoundError(
-        "CAD target path not found or not a supported source file: "
-        f"{unresolved}. Pass a Python generator or STEP/STP file path."
+        f"not a model script cadgen can build: {unresolved}. A model is a Python script that "
+        "decorates a function with @step, @dxf or a mesh decorator (@stl/@glb/@threemf); "
+        "run it with `python <model>.py`."
     )
-
-
-def _expand_specs_with_file_dependencies(specs: Sequence[EntrySpec]) -> list[EntrySpec]:
-    # Shape-only generators don't expose a static recipe to walk for dependency
-    # expansion. The Python source-closure capture in run_script_generator picks
-    # up generator-side .py changes; child STEP changes require --force.
-    return list(specs)
 
 
 def _entries_by_step_path(specs: Sequence[EntrySpec]) -> dict[Path, EntrySpec]:
@@ -913,6 +1059,54 @@ def _entries_by_step_path(specs: Sequence[EntrySpec]) -> dict[Path, EntrySpec]:
     }
 
 
+def retired_render_module_path(step_path: Path) -> Path | None:
+    """The stale ``<out>.step.js`` / ``<out>.stp.js`` beside ``step_path``.
+
+    Animation used to live in a companion ES module discovered by convention.
+    It does not any more: ``@step(animation=...)`` embeds the module text in
+    the document's sidecar, which is what every renderer reads. A leftover file
+    is therefore read by nothing.
+    """
+    if step_path is None:
+        return None
+    companion = step_path.with_name(step_path.name + ".js")
+    try:
+        return companion if companion.is_file() else None
+    except OSError:
+        return None
+
+
+_WARNED_RETIRED_RENDER_MODULES: set[str] = set()
+
+
+def retired_render_module_warning(companion: Path) -> str:
+    return (
+        f"warning: {_display_path(companion)} is a retired render module and is read by nothing, "
+        "so every clip in it is missing from this model: the viewer, snapshots and mesh "
+        "exports play none of them. Migrate it now: animation is declared on the model, "
+        "@step(animation=...) embeds the module text in the document's sidecar. Move this "
+        "file's clips into the decorator, delete the file and rebuild; "
+        "see the cad skill's kinematics reference (references/kinematics.md)."
+    )
+
+
+def _warn_retired_render_module(spec: EntrySpec) -> None:
+    """A stray file nothing reads does not stop a build: the document is still
+    correct without it. It is named once per run, on stderr, with what is lost and
+    the replacement. This is the ONLY place the migration is announced (the Viewer
+    shows no badge for it), so the text has to read as a task, not a remark."""
+    if spec.source != "generated" or not spec.step_output:
+        return
+    companion = retired_render_module_path(spec.step_path)
+    if companion is None:
+        return
+    key = str(companion)
+    if key in _WARNED_RETIRED_RENDER_MODULES:
+        return
+    _WARNED_RETIRED_RENDER_MODULES.add(key)
+    print(retired_render_module_warning(companion), file=sys.stderr)
+
+
 def _validate_step_target(spec: EntrySpec, *, tool_name: str) -> None:
     if spec.step_path is None:
         raise ValueError(f"{tool_name} target has no STEP path: {spec.source_ref}")
@@ -920,10 +1114,15 @@ def _validate_step_target(spec: EntrySpec, *, tool_name: str) -> None:
         metadata = spec.generator_metadata
         if metadata is None or metadata.format != "step":
             raise ValueError(f"{tool_name} target is not a @step model: {spec.source_ref}")
+        # Here rather than in the build: a model whose tree is already current
+        # takes the no-op path, and a retired file beside its document must be
+        # named on every run, not only the ones that rebuild geometry.
+        _warn_retired_render_module(spec)
         return
     raise ValueError(
-        f"{tool_name} builds @step Python sources only: {spec.source_ref}. "
-        "Imported STEP/STP files get render artifacts on demand (inspect, snapshot, CAD Viewer)."
+        f"{tool_name} builds model scripts only: {spec.source_ref} is a document. A STEP/STP "
+        "file needs no build -- every command that reads one (snapshot, the mesh doors, the "
+        "CAD Viewer) compiles its tree on demand; `cadgen step build IN OUT` re-emits one."
     )
 
 
@@ -973,6 +1172,15 @@ def _tree_event(spec: EntrySpec, state: str, **extra: object) -> None:
     emit_event(model_event(model, state, **extra))
 
 
+def _current_source_result(spec: EntrySpec, tree: str | None) -> None:
+    """Capture the current source result now; consumers never reread the record."""
+    if spec.source != "generated" or spec.dxf_path is not None:
+        return
+    from cadgen.daemon.executors import emit_source_result
+    model = _model_for_spec(spec)
+    emit_source_result(model, tree)
+
+
 def _tree_progress_sink(spec: EntrySpec, inner: object | None) -> Callable[[ProgressEvent], None]:
     """Fan a run's phase events out to the caller's sink AND the build tree."""
 
@@ -985,6 +1193,7 @@ def _tree_progress_sink(spec: EntrySpec, inner: object | None) -> Callable[[Prog
             spec, "building", phase=event.label or event.phase,
             done=event.done if event.determinate else None,
             total=event.total if event.determinate else None,
+            detail=event.detail or None,
         )
 
     return sink
@@ -993,10 +1202,11 @@ def _tree_progress_sink(spec: EntrySpec, inner: object | None) -> Callable[[Prog
 class _SkippedGeneration:
     """Marker: a concurrent run ahead of us had already produced a current result."""
 
-    __slots__ = ("spec",)
+    __slots__ = ("spec", "tree")
 
-    def __init__(self, spec: EntrySpec) -> None:
+    def __init__(self, spec: EntrySpec, tree: str | None = None) -> None:
         self.spec = spec
+        self.tree = tree
 
 
 def _run_with_spec_generation_status(
@@ -1004,11 +1214,14 @@ def _run_with_spec_generation_status(
     model_format: str,
     action: Callable[..., object],
     *,
-    skip_if_current: Callable[[EntrySpec], bool] | None = None,
+    skip_if_current: Callable[[EntrySpec], bool | str | None] | None = None,
     progress_sink: object | None = None,
     logger: CliLogger | None = None,
+    on_queued: Callable[[], None] | None = None,
 ) -> object:
     """Run ``action`` under the model's progress record.
+
+    ``on_queued`` is told when the job had to wait for a slot before its body.
 
     Delegates to :func:`cadgen.coordination.artifact_build`, the SAME primitive
     ``cadgen.step_artifact_cli`` uses, so every producer reports the same way.
@@ -1021,21 +1234,38 @@ def _run_with_spec_generation_status(
     del logger
     kind = DRAWING_PACKAGE if model_format == "dxf" else STEP_PACKAGE
     started = time.perf_counter()
+    checked_tree = None
+
+    def is_current():
+        nonlocal checked_tree
+        verdict = skip_if_current(spec)
+        checked_tree = verdict if isinstance(verdict, str) else None
+        return bool(verdict)
+
     with artifact_build(
         kind,
         _spec_output_dir(spec, model_format),
-        is_current=(lambda: bool(skip_if_current(spec))) if skip_if_current is not None else None,
+        is_current=is_current if skip_if_current is not None else None,
         sink=_tree_progress_sink(spec, progress_sink),
     ) as run:
         if run.skipped:
+            if model_format == "step":
+                _current_source_result(spec, checked_tree)
             _tree_event(spec, "current")
-            return _SkippedGeneration(spec)
+            return _SkippedGeneration(spec, checked_tree)
         from cadgen.daemon import broker
 
         # One running build per core: the body and its emit hold a job slot; the
         # wait for a forced child gives it back (cadgen.store.lazy). `queued` shows
         # in the tree only when the slot did not come at once.
-        with broker.held(spec.source_ref, on_queued=lambda: _tree_event(spec, "queued")):
+        from cadgen.authoring import settle_child_builds
+
+        def queued() -> None:
+            _tree_event(spec, "queued")
+            if on_queued is not None:
+                on_queued()
+
+        with broker.held(spec.source_ref, on_queued=queued), settle_child_builds():
             _tree_event(spec, "building", phase="generate")
             try:
                 result = action(spec, run)
@@ -1093,10 +1323,25 @@ def _run_selected_specs(
         results.append(result)
         if isinstance(result, _SkippedGeneration):
             logger.info(f"{spec.cad_ref} was built by a concurrent run; skipped")
+        elif isinstance(result, GeneratedStepResult) and result.step_kept and result.spec.step_path is not None:
+            logger.info(f"kept STEP: {_display_path(result.spec.step_path)} (its bytes would not change)")
         elif success_message is not None:
             message_spec = result.spec if isinstance(result, GeneratedStepResult) else spec
             logger.info(success_message(message_spec))
     return results
+
+
+def _reported_document(spec: EntrySpec) -> str | None:
+    """The document a model run names on stdout, as an ABSOLUTE path: the STEP it
+    declares, or -- for a mesh-only model (`@stl`/`@glb`/`@threemf` with no `@step`)
+    -- the first mesh it declares. A STEP model that also declares meshes still
+    names its STEP: the line names the model's primary document, not everything
+    the build wrote."""
+    if spec.step_output:
+        return str(spec.step_path.expanduser().resolve()) if spec.step_path is not None else None
+    for export in spec.mesh_exports:
+        return str(export.path.expanduser().resolve())
+    return None
 
 
 def _model_for_spec(spec: EntrySpec) -> str | None:
@@ -1120,6 +1365,25 @@ def _assembly_is_current(spec: EntrySpec) -> bool:
 
     model = _model_for_spec(spec)
     return model is not None and not stale(model).stale
+
+
+def _gate_verdict(spec: EntrySpec):
+    """The gate's verdict on a generated model (``store.gate.stale``), or None."""
+    if spec.source != "generated" or spec.step_path is None:
+        return None
+    from cadgen.store.gate import stale
+
+    return stale(_model_for_spec(spec))
+
+
+def _checked_source_tree(spec: EntrySpec, verdict: object | None = None) -> str | None:
+    """The exact source result ``verdict`` checked, if current; without a
+    verdict the gate is asked now."""
+    if spec.source != "generated" or spec.step_path is None:
+        return None
+    if verdict is None:
+        verdict = _gate_verdict(spec)
+    return verdict.tree if not verdict.stale else None
 
 
 def _generated_assembly_glb_closure_current(spec: EntrySpec) -> bool:
@@ -1167,37 +1431,41 @@ def generate_step_targets(
     logger = CliLogger("cadgen", verbose=verbose)
     reported: list[dict[str, object]] = []
 
-    def _emit(spec: EntrySpec, outcome: str) -> None:
-        from cadgen.store.records import current_tree
+    def _emit(spec: EntrySpec, outcome: str, tree: str | None) -> None:
+        from cadgen.daemon.telemetry import job_reused
         from cadgen.store.trees import tree_kind_for
 
-        model = _model_for_spec(spec)
-        tree = current_tree(model) if model is not None else None
+        job_reused(outcome in ("current", "skipped-peer"))  # in a build worker: telemetry's cache hit, or not
         reported.append(
             {
                 "ok": True,
-                # Read off the tree (store.trees.tree_kind), the same answer
-                # inspect gives; the authored kind only steered the packaging.
+                # Read off the tree (store.trees.tree_kind): part or assembly is
+                # what the returned shape was, never something a model declares.
                 "kind": tree_kind_for(tree) or "part",
                 "outcome": outcome,
-                # The document the run wrote (None for a mesh-only model, which
-                # declares no STEP) and the hash of the result tree it came from.
-                "document": _display_path(spec.step_path) if spec.step_output else None,
+                # The document the run wrote, and the hash of the result tree it came
+                # from. A mesh-only model declares no STEP, so it answers with the mesh
+                # it wrote -- a path the caller can open, never the tree hash, which
+                # names nothing on disk. ABSOLUTE in the JSON result, as every door's
+                # is (a machine reader may not share this cwd); the human line below
+                # shows it relative to the cwd.
+                "document": _reported_document(spec),
                 "tree": tree,
             }
         )
 
     def _flush() -> None:
-        # STDOUT IS THE RESULT, on every CLI. `gen` used to print nothing there at all --
-        # its only output was the logger's prose on stderr -- so a caller reading the two
-        # streams apart got an exit code and nothing else, while export, snapshot, validate
-        # and inspect all answered on stdout. One line per target, `outcome document`
-        # (`outcome <tree hash>` for a model with no document), upgraded to JSON by --json.
+        # STDOUT IS THE RESULT, on every CLI: the logger's prose goes to stderr, so a
+        # caller reading the two streams apart finds its answer here, as it does for a
+        # door or a validator. One line per target, `outcome document`, upgraded to
+        # JSON by --json. Every model has a document to name -- a mesh-only one names
+        # its mesh -- so the tree hash is the last resort it never reaches.
         for entry in reported:
             if json_output:
                 print(json.dumps(entry, separators=(",", ":")))
             else:
-                print(f"{entry['outcome']} {entry['document'] or entry['tree']}")
+                document = entry["document"]
+                print(f"{entry['outcome']} {_display_path(Path(document)) if document else entry['tree']}")
     all_specs, selected_specs = _selected_specs_for_targets(targets, step_options=step_options)
     for spec in selected_specs:
         _validate_step_target(spec, tool_name=tool_name)
@@ -1206,32 +1474,40 @@ def generate_step_targets(
     # Children are not rebuilt here any more: a parent depends on its children by
     # RESULT (their pinned trees, gate clause 3), and a stale child is built when
     # the parent's body calls it (cadgen.authoring._compose_child).
+    # One gate verdict per model per job: the fast path's, re-taken only once the
+    # job waited for a slot or another model of this run built, either of which
+    # can change the answer. The already-stale notice after publishing asks anew.
+    verdicts: dict[str, object] = {}
+
+    def verdict_for(spec: EntrySpec):
+        if spec.source_ref not in verdicts:
+            verdicts[spec.source_ref] = _gate_verdict(spec)
+        return verdicts[spec.source_ref]
+
     # No-op fast path: skip recomposing a model the gate says is current.
     if not force:
-        current_specs = [
-            spec
+        current_trees = {
+            spec.source_ref: tree
             for spec in selected_specs
-            # An explicit STEP export (--write) keeps the spec in the run
-            # UNLESS the recorded export already matches the current closure —
-            # then it is reused (or copied into place), never rebuilt.
-            if (not _spec_requests_extra_outputs(spec) or _step_export_current(spec))
-            and _assembly_is_current(spec)
-            and _assembly_glb_package_current(spec)
-        ]
+            if (tree := _checked_source_tree(spec, verdict_for(spec))) is not None
+        }
+        current_specs = [spec for spec in selected_specs if spec.source_ref in current_trees]
         if current_specs:
             for spec in current_specs:
-                if spec.step_export_path is not None:
-                    logger.info(
-                        f"{spec.cad_ref} step export is current; reusing "
-                        f"{_display_path(spec.step_export_path)}"
-                    )
-                else:
-                    logger.info(f"{spec.cad_ref} is current; not rebuilt")
+                tree = current_trees[spec.source_ref]
+                _current_source_result(spec, tree)
+                document = _reported_document(spec)
+                logger.info(
+                    f"{_display_path(Path(document)) if document else spec.cad_ref} is current; not rebuilt"
+                )
                 # A current model can still owe declared mesh exports (deleted
                 # file, changed declaration): heal them from the store package
                 # without leaving the no-op path.
-                _produce_declared_mesh_exports(spec, logger=logger)
-                _emit(spec, "current")
+                if _produce_declared_mesh_exports(spec, logger=logger, source_tree=tree):
+                    from cadgen.daemon.telemetry import job_reused
+
+                    job_reused(False)  # meshes written now: not all of it was the store's
+                _emit(spec, "current", tree)
                 _tree_event(spec, "current")
             current_refs = {spec.source_ref for spec in current_specs}
             selected_specs = [spec for spec in selected_specs if spec.source_ref not in current_refs]
@@ -1243,13 +1519,11 @@ def generate_step_targets(
 
     # Same condition as the fast path above, re-checked when the run opens so a run
     # that started behind a concurrent build of this model no-ops instead of
-    # rebuilding it. --force and explicit extra outputs always do the work.
-    def _built_by_a_peer(spec: EntrySpec) -> bool:
+    # rebuilding it. --force always does the work.
+    def _built_by_a_peer(spec: EntrySpec) -> str | None:
         if force:
-            return False
-        if _spec_requests_extra_outputs(spec) and not _step_export_current(spec):
-            return False
-        return _assembly_is_current(spec) and _assembly_glb_package_current(spec)
+            return None
+        return _checked_source_tree(spec, verdict_for(spec))
 
     def generate_step(spec: EntrySpec, progress_sink: object | None = None) -> object:
         def build(tracked_spec: EntrySpec, reporter: object) -> object:
@@ -1259,16 +1533,28 @@ def generate_step_targets(
                 logger=logger,
                 force=force,
                 progress=reporter,
+                verdict=None if force else verdict_for(tracked_spec),
             )
 
-        return _run_with_spec_generation_status(
-            spec,
-            "step",
-            build,
-            skip_if_current=_built_by_a_peer,
-            progress_sink=progress_sink,
-            logger=logger,
-        )
+        from cadgen.daemon.executors import capture_source_result
+
+        try:
+            with capture_source_result(_model_for_spec(spec)) as captured:
+                result = _run_with_spec_generation_status(
+                    spec,
+                    "step",
+                    build,
+                    skip_if_current=_built_by_a_peer,
+                    progress_sink=progress_sink,
+                    logger=logger,
+                    on_queued=lambda: verdicts.pop(spec.source_ref, None),
+                )
+                captured._finish(0)
+                if spec.source == "generated":
+                    result.tree = captured.wait_result()
+                return result
+        finally:
+            verdicts.clear()
 
     results = _run_selected_specs(
         selected_specs,
@@ -1277,7 +1563,7 @@ def generate_step_targets(
         success_message=_generated_python_glb_summary,
     )
     for spec, result in zip(selected_specs, results):
-        _emit(spec, "skipped-peer" if isinstance(result, _SkippedGeneration) else "built")
+        _emit(spec, "skipped-peer" if isinstance(result, _SkippedGeneration) else "built", result.tree)
     logger.total()
     _flush()
     return 0
@@ -1299,12 +1585,17 @@ def generate_dxf_targets(
     reported: list[dict[str, object]] = []
 
     def _emit(spec: EntrySpec, outcome: str) -> None:
+        from cadgen.daemon.telemetry import job_reused
+
+        job_reused(outcome in ("current", "skipped-peer"))  # in a build worker: telemetry's cache hit, or not
         reported.append(
             {
                 "ok": True,
                 "kind": "drawing",
                 "outcome": outcome,
-                "document": _display_path(spec.dxf_path) if spec.dxf_path is not None else None,
+                # Absolute in the JSON result, like every door's; the human line
+                # shows it relative to the cwd.
+                "document": str(spec.dxf_path.expanduser().resolve()) if spec.dxf_path is not None else None,
                 "tree": None,
             }
         )
@@ -1314,17 +1605,25 @@ def generate_dxf_targets(
             if json_output:
                 print(json.dumps(entry, separators=(",", ":")))
             else:
-                print(f"{entry['outcome']} {entry['document']}")
+                document = entry["document"]
+                print(f"{entry['outcome']} {_display_path(Path(document)) if document else None}")
 
-    def dxf_output_current(script_path: Path, output_path: Path | None) -> bool:
+    def dxf_output_current(spec: EntrySpec, output_path: Path | None) -> bool:
         # The ONE gate every model answers to (STORE.md §4): the drawing's record,
         # its closure, its pinned children and its .dxf output.
+        #
+        # Ask it by the model's IDENTITY (``script::fn``), never by the bare script
+        # path: a file may hold several models, and a bare path is ambiguous there --
+        # cadgen.store.index.resolve_model_ref refuses it rather than guessing, which
+        # would fail the drawing before it ever reached its own gate.
         if output_path is None:
             return False
-        verdict = stale(script_path)
+        model = _model_for_spec(spec)
+        if model is None:
+            return False
+        verdict = stale(model)
         return not verdict.stale
 
-    tool_name = "dxf"
     logger = CliLogger("cadgen", verbose=verbose)
     all_specs, selected_specs = _selected_specs_for_targets(targets)
     for spec in selected_specs:
@@ -1343,10 +1642,13 @@ def generate_dxf_targets(
             spec
             for spec in selected_specs
             if spec.script_path is not None
-            and dxf_output_current(spec.script_path, _effective_output(spec))
+            and dxf_output_current(spec, _effective_output(spec))
         ]
         for spec in current_specs:
-            logger.info(f"{spec.cad_ref} is current; not rebuilt")
+            logger.info(
+                f"{_display_path(spec.dxf_path) if spec.dxf_path is not None else spec.cad_ref} "
+                "is current; not rebuilt"
+            )
             _emit(spec, "current")
         current_refs = {spec.source_ref for spec in current_specs}
         selected_specs = [spec for spec in selected_specs if spec.source_ref not in current_refs]
@@ -1356,7 +1658,7 @@ def generate_dxf_targets(
         def _built_by_a_peer(spec: EntrySpec) -> bool:
             if force or spec.script_path is None:
                 return False
-            return dxf_output_current(spec.script_path, _effective_output(spec))
+            return dxf_output_current(spec, _effective_output(spec))
 
         results = _run_selected_specs(
             selected_specs,

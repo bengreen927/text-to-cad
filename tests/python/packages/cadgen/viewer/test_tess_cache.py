@@ -1,8 +1,8 @@
-"""The shared tessellation cache: name validation, store I/O, and TESB framing.
+"""The viewer's tessellation-cache transport and shared TESB framing.
 
 Ports ``tessCache.test.mjs``. The container test does not read the format by
 eye — it hands the Python encoder's bytes to the AUTHORITATIVE decoder in
-``packages/cadgen-js``, which is where the format lives. A hand-written
+``packages/core``, which is where the format lives. A hand-written
 assertion about offsets would pass just as happily against a subtly wrong
 encoder, and the client would then silently fall back to one round trip per
 component for the life of the page.
@@ -10,12 +10,14 @@ component for the life of the page.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from cadgen.viewer.tess_cache import (
@@ -23,16 +25,24 @@ from cadgen.viewer.tess_cache import (
     read_tess_cache_batch,
     read_tess_cache_entry,
     tess_cache_key_from_route_path,
-    tessellation_cache_dir,
     write_tess_cache_entry,
 )
+from cadgen.store.tess_cache import tessellation_cache_dir
 
-GOOD_KEY = "c0ffee-t1-l1.500000e-3-a3.500000e-1"
+from tests.python.support.tessellation import tessellation_fixture
 
-# The authoritative codec: cadgen-js in this repository. The suite is root-owned
+FIXTURE = tessellation_fixture()
+GOOD_KEY = FIXTURE["key"]
+PAYLOAD = base64.b64decode(FIXTURE["bytes"])
+
+def admitted(key=GOOD_KEY, size=None):
+    return {"tessellationInput": key, "object": FIXTURE["facts"]["object"],
+            "maxBytes": len(PAYLOAD) if size is None else size}
+
+# The authoritative codec: @text-to-cad/core in this repository. The suite is root-owned
 # and runs from a checkout, so the source path is always present -- no skip.
 REPO_ROOT = Path(__file__).resolve().parents[5]
-CADGEN_JS_CODEC = REPO_ROOT / "packages" / "cadgen-js" / "src" / "lib" / "surf" / "tessellationCache.js"
+CADGEN_JS_CODEC = REPO_ROOT / "packages" / "core" / "src" / "lib" / "surf" / "tessellationCache.js"
 
 
 class TessCacheTestCase(unittest.TestCase):
@@ -76,8 +86,8 @@ class NameValidation(TessCacheTestCase):
         self.assertEqual(tess_cache_key_from_route_path(self.route(f"{GOOD_KEY}.tess")), GOOD_KEY)
 
     def test_traversal_separators_hidden_names_and_spaces_are_refused(self):
-        # The cache lives OUTSIDE every served root, so containment cannot help
-        # here: this pattern is the whole defence.
+        # The cache lives outside every folder a file is served from, so containment
+        # cannot help here: this pattern is the whole defence.
         for name in (
             "../escape.tess",
             "sub/dir.tess",
@@ -106,7 +116,7 @@ class NameValidation(TessCacheTestCase):
 
 class StoreRoundTrip(TessCacheTestCase):
     def test_write_then_read_returns_the_exact_bytes(self):
-        payload = b"\x00\x01binary\xff"
+        payload = PAYLOAD
         self.assertEqual(write_tess_cache_entry(self.route(f"{GOOD_KEY}.tess"), payload), 204)
         status, body = read_tess_cache_entry(self.route(f"{GOOD_KEY}.tess"))
         self.assertEqual(status, 200)
@@ -122,7 +132,7 @@ class StoreRoundTrip(TessCacheTestCase):
         self.assertEqual(read_tess_cache_entry(self.route(f"{GOOD_KEY}.tess"))[0], 404)
 
     def test_the_write_leaves_no_temp_file_behind(self):
-        write_tess_cache_entry(self.route(f"{GOOD_KEY}.tess"), b"payload")
+        write_tess_cache_entry(self.route(f"{GOOD_KEY}.tess"), PAYLOAD)
         names = os.listdir(tessellation_cache_dir())
         self.assertEqual(names, [GOOD_KEY], "an index entry is keyed by the cache key itself")
 
@@ -133,7 +143,7 @@ class StoreRoundTrip(TessCacheTestCase):
         self.assertFalse(os.path.exists(tessellation_cache_dir()))
 
     def test_the_enable_flag_is_read_per_call(self):
-        write_tess_cache_entry(self.route(f"{GOOD_KEY}.tess"), b"payload")
+        write_tess_cache_entry(self.route(f"{GOOD_KEY}.tess"), PAYLOAD)
         os.environ["CADGEN_MESH_CACHE"] = "0"
         self.assertEqual(read_tess_cache_entry(self.route(f"{GOOD_KEY}.tess"))[0], 404)
         os.environ.pop("CADGEN_MESH_CACHE")
@@ -142,13 +152,17 @@ class StoreRoundTrip(TessCacheTestCase):
 
 class BatchRequests(TessCacheTestCase):
     def test_a_malformed_request_is_none_so_the_route_can_answer_400(self):
-        for body in (b"not json", b"[]", b'{"names":"x"}', b"{}", b'{"names":null}'):
+        # CPython's C JSON scanner has a separate recursion guard from
+        # sys.getrecursionlimit(); this remains below the HTTP metadata cap.
+        depth = 10_000
+        for body in (b"not json", b"[]", b'{"names":"x"}', b"{}", b'{"names":null}',
+                     b'{"entries":' + b'[' * depth + b'0' + b']' * depth + b'}'):
             with self.subTest(body=body):
                 self.assertIsNone(read_tess_cache_batch(body))
 
     def test_more_than_the_cap_is_refused(self):
-        self.assertIsNone(read_tess_cache_batch(json.dumps({"names": ["a.tess"] * 4097}).encode()))
-        self.assertIsNotNone(read_tess_cache_batch(json.dumps({"names": []}).encode()))
+        self.assertIsNone(read_tess_cache_batch(json.dumps({"entries": [admitted()] * 257}).encode()))
+        self.assertIsNotNone(read_tess_cache_batch(json.dumps({"entries": []}).encode()))
 
     def test_one_undecodable_byte_is_a_per_entry_miss_not_a_400(self):
         """``Buffer.from(body).toString("utf8")`` substitutes; it does not throw.
@@ -161,8 +175,8 @@ class BatchRequests(TessCacheTestCase):
         """
         import struct
 
-        write_tess_cache_entry(self.route(f"{GOOD_KEY}.tess"), b"AAA")
-        body = json.dumps({"names": [f"{GOOD_KEY}.tess", "NAME_HERE.tess"]}).encode()
+        write_tess_cache_entry(self.route(f"{GOOD_KEY}.tess"), PAYLOAD)
+        body = json.dumps({"entries": [admitted(), admitted("NAME_HERE")]}).encode()
         container = read_tess_cache_batch(body.replace(b"NAME_HERE", b"\xe9"))
         self.assertIsNotNone(container, "a bad byte must not fail the whole batch")
         # The header's third word is the entry count: the real hit, plus the
@@ -174,7 +188,7 @@ class BatchFramingMatchesTheAuthoritativeCodec(TessCacheTestCase):
     """The Python encoder's bytes must decode with the JS decoder that owns the format.
 
     Neither precondition is allowed to make this disappear quietly. A missing
-    codec is a FAILURE — cadgen-js ships with the app, so its absence means the
+    codec is a FAILURE — @text-to-cad/core ships with the app, so its absence means the
     tree is broken, not that this machine is unusual. A missing `node` is a
     failure too: the client is a JavaScript app, so anywhere this suite runs
     can run its decoder. Skipping on either is how the check went dead the
@@ -186,7 +200,7 @@ class BatchFramingMatchesTheAuthoritativeCodec(TessCacheTestCase):
         if not CADGEN_JS_CODEC.is_file():
             raise AssertionError(
                 f"the authoritative tessellation-cache codec is missing: {CADGEN_JS_CODEC}. "
-                "cadgen-js is vendored at packages/cadgen-js and ships with this app; "
+                "@text-to-cad/core is vendored at packages/core and ships with this app; "
                 "without it the Python encoder's framing is verified by nothing."
             )
         if not shutil.which("node"):
@@ -217,39 +231,36 @@ class BatchFramingMatchesTheAuthoritativeCodec(TessCacheTestCase):
         return json.loads(result.stdout)
 
     def test_hit_miss_and_refusal_decode_in_order(self):
-        write_tess_cache_entry(self.route(f"{GOOD_KEY}.tess"), b"AAA")
+        write_tess_cache_entry(self.route(f"{GOOD_KEY}.tess"), PAYLOAD)
         container = read_tess_cache_batch(
             json.dumps(
-                {"names": [f"{GOOD_KEY}.tess", "absent-t1.tess", "../escape.tess"]}
+                {"entries": [admitted(), admitted("absent-t1"), admitted("../escape")]}
             ).encode()
         )
         # A refused name and a miss are per-entry MISSES, never errors: one bad
         # key must not cost an assembly its whole round trip.
-        self.assertEqual(self.decode_with_node(container), [[65, 65, 65], None, None])
+        self.assertEqual(self.decode_with_node(container), [list(PAYLOAD), None, None])
 
     def test_unaligned_payloads_round_trip(self):
         # 1, 2 and 3 mod 4 all exercise the padding; a decoder that advances by
         # the raw length instead of the aligned one desynchronises after the
         # first such entry.
-        names = []
-        for size in (1, 2, 3, 4, 5):
-            key = f"pad{size}-t1-l1-a1"
-            write_tess_cache_entry(self.route(f"{key}.tess"), bytes(range(size)))
-            names.append(f"{key}.tess")
-        container = read_tess_cache_batch(json.dumps({"names": names}).encode())
-        self.assertEqual(
-            self.decode_with_node(container), [list(range(size)) for size in (1, 2, 3, 4, 5)]
-        )
+        # Framing also accepts odd-length body readers; real TESS v4 bodies
+        # themselves are aligned. Keep this isolated from payload validation.
+        entries = [bytes(range(size)) for size in (1, 2, 3, 4, 5)]
+        with mock.patch("cadgen.store.tess_cache.read_tessellation_cache", side_effect=entries):
+            container = read_tess_cache_batch(json.dumps({"entries": [admitted()] * 5}).encode())
+        self.assertEqual(self.decode_with_node(container), [list(entry) for entry in entries])
 
     def test_a_non_string_name_is_a_miss_and_keeps_the_container_valid(self):
-        write_tess_cache_entry(self.route(f"{GOOD_KEY}.tess"), b"Z")
+        write_tess_cache_entry(self.route(f"{GOOD_KEY}.tess"), PAYLOAD)
         container = read_tess_cache_batch(
-            json.dumps({"names": [17, f"{GOOD_KEY}.tess", None]}).encode()
+            json.dumps({"entries": [17, admitted(), None]}).encode()
         )
-        self.assertEqual(self.decode_with_node(container), [None, [90], None])
+        self.assertEqual(self.decode_with_node(container), [None, list(PAYLOAD), None])
 
     def test_an_empty_request_still_produces_a_valid_container(self):
-        container = read_tess_cache_batch(json.dumps({"names": []}).encode())
+        container = read_tess_cache_batch(json.dumps({"entries": []}).encode())
         self.assertEqual(len(container), 12)
         self.assertEqual(self.decode_with_node(container), [])
 

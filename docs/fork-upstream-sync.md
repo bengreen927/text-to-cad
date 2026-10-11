@@ -1,4 +1,26 @@
-# Fork integration: upstream v0.5.0
+# Fork integration with upstream
+
+## 2026-10-11 sync: upstream 0.7.20
+
+Base: upstream `main` at `b48ff49e` (release 0.7.20), merged into the fork on
+branch `sync-upstream-0.7.20`.
+
+- The fork's runtime patch is superseded. Upstream 0.7.x removed
+  `cadgen step inspect` and `cadgen.interference` and replaced them with Python
+  checks over `cadgen.geometry`. `overlap_volume` raises `GeometryError` when a
+  boolean fails instead of returning zero, which is the fail-closed behavior the
+  fork's interference patch added. The fork now carries no Python runtime
+  changes, so the fork-built wheel described below is no longer needed. The
+  skills run the published `cadgen==0.7.20` through `uvx`.
+- The fork's guidance (`cad-as-config.md`, `reverse-engineering-from-photos.md`,
+  `engineering-drawing-sheets.md`, acceptance checks, frame contracts) is kept
+  and rewritten for the Python inspection API.
+- The publish, docs-deploy, and new API-deploy workflows run only in
+  `earthtojake/text-to-cad`.
+- Upstream 0.7.19 and later send telemetry; see the sync report before
+  installing this version.
+
+# Upstream v0.5.0 (historical)
 
 This fork tracks `earthtojake/text-to-cad` while retaining generic drawings-first,
 photo-measurement and configuration-driven modeling guidance. Upstream updates

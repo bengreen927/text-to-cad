@@ -7,6 +7,10 @@ semantics (a slot is a connection; closing it releases) are the ones production 
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 import unittest
@@ -17,6 +21,136 @@ from tests.python.support.paths import add_repo_path
 add_repo_path("packages/cadgen/src")
 
 from cadgen.daemon import broker  # noqa: E402
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX listeners own a socket filesystem entry")
+class PrivateBrokerCleanup(unittest.TestCase):
+    def test_delayed_accept_owner_keeps_socket_until_listener_disposal(self):
+        entered, native_done, release = threading.Event(), threading.Event(), threading.Event()
+        original_accept = broker.transport.mpc.Listener.accept
+
+        def delayed_accept(listener):
+            entered.set()
+            try:
+                return original_accept(listener)
+            finally:
+                native_done.set()
+                if not release.wait(5):
+                    raise TimeoutError("test did not release the accept owner")
+
+        # close() waits a bounded time for its threads; this owner is held past it.
+        with mock.patch.object(broker.transport.mpc.Listener, "accept", new=delayed_accept), \
+                mock.patch.object(broker, "CLOSE_JOIN_SECONDS", 0.05):
+            private = broker.PrivateBroker(limit=1)
+            # Capture the stdlib unlink receipt to check both its active lifetime
+            # and its idempotence after the accept owner disposes the listener.
+            finalizer = private._server._listener._listener._unlink
+            try:
+                self.assertTrue(entered.wait(2), "accept did not begin")
+                private.close()
+                private.close()
+                self.assertTrue(native_done.wait(2), "close did not wake native accept")
+                self.assertTrue(private._thread.is_alive(), "accept owner was not held")
+                self.assertTrue(Path(private.address).exists(), "broker unlinked the listener's live socket")
+                self.assertTrue(finalizer.still_active())
+            finally:
+                release.set()
+                private.close()
+                private._thread.join(2)
+            self.assertFalse(private._thread.is_alive())
+            self.assertFalse(Path(private.address).exists())
+            self.assertFalse(finalizer.still_active())
+            self.assertIsNone(finalizer())
+
+    def test_process_exit_finalizes_socket_before_delayed_accept_owner(self):
+        script = textwrap.dedent("""
+            import threading
+            from cadgen.daemon import broker, transport
+
+            entered = threading.Event()
+            native_done = threading.Event()
+            parked = threading.Event()
+            original_accept = transport.mpc.Listener.accept
+
+            def delayed_accept(listener):
+                entered.set()
+                try:
+                    return original_accept(listener)
+                finally:
+                    native_done.set()
+                    parked.wait(30)
+
+            transport.mpc.Listener.accept = delayed_accept
+            broker.CLOSE_JOIN_SECONDS = 0.05  # this owner is held past close's bounded wait
+            private = broker.PrivateBroker(limit=1)
+            assert entered.wait(2), 'accept did not begin'
+            private.close()
+            assert native_done.wait(2), 'close did not wake native accept'
+            assert private._thread.is_alive(), 'accept owner was not held'
+            print(private.address, flush=True)
+            # Normal process exit runs multiprocessing's finalizers while the
+            # daemon accept thread is still parked above.
+        """)
+        completed = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        address = completed.stdout.strip()
+        self.assertTrue(address, "child did not report its owned socket")
+        self.addCleanup(broker.transport.clear_address, address)
+        self.assertEqual(completed.stderr, "", "process-exit finalizer wrote a traceback")
+        self.assertFalse(Path(address).exists())
+
+
+class PrivateBrokerCloseWaits(unittest.TestCase):
+    """close() returns only once the broker's own threads have ended. A daemon thread
+    still returning from a socket call when the interpreter finalizes takes the GIL
+    from a dying runtime, which crashed a no-op build (SIGSEGV, sock_accept -> take_gil)."""
+
+    def test_close_returns_after_its_accept_thread_ends(self):
+        entered = threading.Event()
+        original_accept = broker.transport.mpc.Listener.accept
+
+        def slow_wakeup(listener):
+            entered.set()
+            try:
+                return original_accept(listener)
+            finally:
+                time.sleep(0.2)  # still busy when an unwaited close would have returned
+
+        with mock.patch.object(broker.transport.mpc.Listener, "accept", new=slow_wakeup):
+            private = broker.PrivateBroker(limit=1)
+            self.assertTrue(entered.wait(2), "accept did not begin")
+            private.close()
+        self.assertFalse(private._thread.is_alive(), "close returned while its accept thread ran")
+
+    def test_close_waits_for_a_request_in_flight(self):
+        private = broker.PrivateBroker(limit=1)
+        with mock.patch.dict(os.environ, private.env()):
+            before = set(threading.enumerate())
+            lease = broker.acquire_slot("held")
+            serving = set(threading.enumerate()) - before
+            release = threading.Timer(0.2, lease.release)
+            release.start()
+            private.close()
+            alive = [t for t in serving if t.is_alive()]  # read before the lease is surely gone
+            release.join()
+        self.assertTrue(serving, "no thread served the lease")
+        self.assertEqual(alive, [], "close returned while a request was served")
+
+    def test_close_returns_after_a_silent_peers_handshake_ends(self):
+        private = broker.PrivateBroker(limit=1)
+        before = set(threading.enumerate())
+        # Connected, challenged, and never answering: its handshake runs until close.
+        silent = broker.transport.mpc.Client(private.address, family=broker.transport._family())
+        self.addCleanup(silent.close)
+        self.assertTrue(silent.poll(10), "the broker sent no challenge")
+        self.assertTrue(silent.recv_bytes().startswith(b"#CHALLENGE#"))
+        handshakes = [t for t in set(threading.enumerate()) - before if t.name == "cadgen-handshake"]
+        self.assertTrue(handshakes, "no thread ran the handshake")
+        private.close()
+        alive = [t for t in handshakes if t.is_alive()]
+        self.assertEqual(alive, [], "close returned while a silent peer's handshake ran")
 
 
 class PrivateBrokerFixture(unittest.TestCase):
@@ -124,6 +258,37 @@ class Slots(PrivateBrokerFixture):
 
 class Coalescing(PrivateBrokerFixture):
     LIMIT = 4
+
+    def test_late_subscriber_gets_exact_source_result_before_exit(self):
+        mine = broker.claim_inflight("/m/leaf.py::leaf", "sha-1")
+        event = {"sourceResult": {"model": "/m/leaf.py::leaf", "tree": "immutable-source"}}
+        broker.report_result(mine[1], event)
+        theirs = broker.claim_inflight("/m/leaf.py::leaf", "sha-1")
+        ready = threading.Event()
+        results = []
+        exits = []
+
+        def receive(event):
+            results.append(event)
+            ready.set()
+
+        thread = threading.Thread(target=lambda: exits.append(broker.wait_attached(theirs[1], on_event=receive)))
+        thread.start()
+        try:
+            self.assertTrue(ready.wait(3))
+            self.assertEqual(results, [event])
+            self.assertEqual(exits, [])
+        finally:
+            broker.report_done(mine[1], 1)
+            thread.join(5)
+        self.assertEqual(exits, [1])
+
+    def test_different_stores_do_not_share_source_results(self):
+        first = broker.claim_inflight("/m/leaf.py", "sha-1", store_root="/store/first")
+        second = broker.claim_inflight("/m/leaf.py", "sha-1", store_root="/store/second")
+        self.assertEqual((first[0], second[0]), ("yours", "yours"))
+        broker.report_done(first[1], 0)
+        broker.report_done(second[1], 0)
 
     def test_identical_source_in_flight_is_joined_not_rebuilt(self):
         mine = broker.claim_inflight("/m/leaf.py", "sha-1")

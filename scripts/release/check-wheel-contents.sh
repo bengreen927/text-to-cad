@@ -4,7 +4,8 @@ set -euo pipefail
 # Assert the cadgen wheel actually contains its runtime assets.
 #
 # cadgen ships JavaScript it executes (Node builders, the snapshot browser bundle, the
-# CAD Viewer's built client) and non-Python data its server reads (collation.json).
+# CAD Viewer's built client), the native file tracer every build loads, and non-Python
+# data its server reads (collation.json).
 # Those arrive through `[tool.setuptools.package-data]`, which is exactly the kind of
 # declaration that fails QUIETLY: a glob that does not match nested files produces a
 # wheel that imports fine, passes every Python test, and then cannot build a DXF preview
@@ -12,7 +13,9 @@ set -euo pipefail
 # same shape of bug in JS bundling (an entry tree-shaken to a 20-byte shebang, exit
 # code 0).
 #
-# So: build the wheel, list it, and require the paths to be present. The viewer client
+# So: build in clean scratch, require the paths, and compare every runtime file's bytes
+# with the bundled source. Reusing setuptools' build/lib can retain obsolete hashed
+# viewer chunks even after the source bundle removed them. The viewer client
 # is NOT committed (scripts/bundle/cadgen-runtime.sh --viewer writes it
 # right before the build), so this is the only gate proving it made the wheel.
 
@@ -26,6 +29,8 @@ PYTHON_BIN="${PYTHON_BIN:-}"
 if [ -z "$PYTHON_BIN" ]; then
   if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
     PYTHON_BIN="$REPO_ROOT/.venv/bin/python"
+  elif [ -x "$REPO_ROOT/.venv/Scripts/python.exe" ]; then
+    PYTHON_BIN="$REPO_ROOT/.venv/Scripts/python.exe"
   else
     PYTHON_BIN="python3"
   fi
@@ -70,19 +75,33 @@ REQUIRED=(
   "cadgen/step_topology_artifact.py"
   "cadgen/_internal/node_resolve_register.mjs"
   "cadgen/_internal/node_resolve_hooks.mjs"
-  "cadgen/_runtime/node/dxf-mesh.mjs"
   "cadgen/_runtime/node/mesh-export.mjs"
   "cadgen/_runtime/node/package.json"
   "cadgen/_runtime/node/THIRD_PARTY_LICENSES.txt"
   "cadgen/_runtime/browser/snapshot-render.js"
   "cadgen/_runtime/browser/render.html"
   "cadgen/_runtime/viewer/index.html"
+  # CAD in an agent host: the server `cadgen mcp` runs and the one page it serves.
+  "cadgen/cli/mcp.py"
+  "cadgen/mcp/server.py"
+  "cadgen/mcp/tunnel.py"
+  "cadgen/_runtime/mcp/index.html"
+  # The file tracer every build loads, one per platform: a wheel missing one builds
+  # nothing on that platform.
+  "cadgen/_runtime/native/filetrace-macos-aarch64.dylib"
+  "cadgen/_runtime/native/filetrace-macos-x86_64.dylib"
+  "cadgen/_runtime/native/filetrace-linux-x86_64.so"
+  "cadgen/_runtime/native/filetrace-linux-aarch64.so"
+  "cadgen/_runtime/native/filetrace-windows-x86_64.dll"
 )
 
 echo "Building cadgen wheel for content check..."
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
-"$PYTHON_BIN" -m build --wheel --outdir "$OUT_DIR" "$PACKAGE_DIR" >"$OUT_DIR/build.log" 2>&1 || {
+BUILD_SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/cadgen-wheel-build.XXXXXX")"
+trap 'rm -rf "$BUILD_SCRATCH"' EXIT
+"$PYTHON_BIN" "$SCRIPT_DIR/wheel_contents.py" stage "$PACKAGE_DIR" "$BUILD_SCRATCH/package"
+"$PYTHON_BIN" -m build --wheel --outdir "$OUT_DIR" "$BUILD_SCRATCH/package" >"$OUT_DIR/build.log" 2>&1 || {
   echo "Wheel build failed:" >&2
   tail -40 "$OUT_DIR/build.log" >&2
   echo "" >&2
@@ -131,6 +150,7 @@ if [ -n "$missing" ]; then
   exit 1
 fi
 
+"$PYTHON_BIN" "$SCRIPT_DIR/wheel_contents.py" verify "$wheel" "$PACKAGE_DIR"
 echo "cadgen wheel carries its runtime assets ($runtime_count entries under cadgen/_runtime)."
 if [ "$KEEP_WHEEL" != "1" ]; then
   rm -rf "$OUT_DIR"

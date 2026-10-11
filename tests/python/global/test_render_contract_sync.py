@@ -6,7 +6,7 @@ viewer scanner's package-path constants drifted silently once nothing compared
 them) — these greps are the structural version of that comparison: a one-sided
 bump fails CI before it can ship a viewer that cannot read what cadgen writes.
 
-The CLIENT half of that boundary is JS — ``packages/cadgen-js`` parses ``.surf``
+The CLIENT half of that boundary is JS — ``packages/core`` parses ``.surf``
 in the browser — so the SURF_VERSION pin stays here. The viewer BACKEND is
 ``cadgen.viewer`` now and reads the store through cadgen's own helpers, so there
 is no second derivation of a store key left to compare; what remains for it here
@@ -44,30 +44,30 @@ class RenderContractSyncTest(unittest.TestCase):
         )
         js_version = _extract(
             r"^export const SURF_VERSION = (\d+);$",
-            ROOT / "packages/cadgen-js/src/lib/surf/container.js",
+            ROOT / "packages/core/src/lib/surf/container.js",
         )
         self.assertEqual(
             python_version,
             js_version,
             "SURF_VERSION diverged between the Python extractor and the JS "
-            "surf parser — bump both together (and CACHE_SCHEMA_VERSION with "
-            "them; a .surf the client cannot parse renders nothing).",
+            "surf parser — bump both together; a .surf the client cannot parse "
+            "renders nothing. SURF_VERSION is the surface artifact's own version "
+            "and never touches geometry identity (GEOMETRY_SCHEME).",
         )
 
-    def test_sidecar_schema_matches_the_js_kinematics_loader(self) -> None:
-        # What is genuinely cross-language is the CLIENT: the kinematics loader
-        # runs in the browser and REFUSES any other schema, so a one-sided bump
-        # makes every model's kinematics fail to load.
+    def test_sidecar_schema_matches_the_js_source_sidecar_loader(self) -> None:
+        # What is genuinely cross-language is the CLIENT: the shared sidecar
+        # loader runs in the browser and REFUSES any other schema.
         sidecar_module = ROOT / "packages/cadgen/src/cadgen/_internal/source_sidecar.py"
         self.assertEqual(
             _extract(r"^SOURCE_SIDECAR_SCHEMA_VERSION = (\d+)$", sidecar_module),
             _extract(
                 r"^export const SOURCE_SIDECAR_SCHEMA_VERSION = (\d+);",
-                ROOT / "packages/cadgen-js/src/common/kinematicsModule.js",
+                ROOT / "packages/core/src/common/sourceSidecar.js",
             ),
             "SOURCE_SIDECAR_SCHEMA_VERSION diverged between cadgen and the JS "
-            "kinematics loader — the loader REFUSES any other schema, so a "
-            "one-sided bump makes every model's kinematics fail to load",
+            "source-sidecar loader — the loader REFUSES any other schema, so a "
+            "one-sided bump makes document annotations fail to load",
         )
 
     def test_component_blob_format_is_pinned_not_current(self) -> None:

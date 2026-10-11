@@ -33,10 +33,10 @@ separate.
 ## Configuration and model entry points
 
 Use named Python constants or literal dictionaries imported from a shared module.
-If users maintain JSON or YAML, validate and resolve it into that Python module
-before running the models. Ordinary data-file reads are not tracked inputs in
-v0.5, so changing only that file can leave a model incorrectly current. See
-[step-generation.md](step-generation.md) for the freshness contract.
+If users maintain JSON or YAML, validate it and resolve it into that Python
+module, or read it from the model. Every file a build opens is a tracked input,
+so changing it rebuilds the model. See [step-generation.md](step-generation.md)
+for the freshness contract.
 Validate consumed keys, units, finite values, ranges, and relationships; reject
 misspelled required keys. YAML needs a real parser.
 Environment variables, the working directory, time, and randomness are not
@@ -69,10 +69,11 @@ the same dimensions. Run model scripts to build them. Inspection and snapshot
 commands take the resulting documents; they do not run a `.py` script.
 
 Use one model per coherent artifact. Compose assembly children by importing and
-calling their model functions, preserve meaningful `AssemblyHelper`
-relationships, and place children with `Pos/Rot/Location * child` or
-`child.moved(loc)`. For vendor geometry, use `cadgen.read_step`, retain its
-source identity, and derive project placement from inspected datums.
+calling their model functions, express placement with native build123d joints
+or explicit transforms (`AssemblyHelper` is deprecated), and place children with
+`Pos/Rot/Location * child` or `child.moved(loc)`. For vendor geometry, use
+`cadgen.read_step`, retain its source identity, and derive project placement
+from datums measured with `read_scene`.
 
 Keep configuration updates idempotent. When a factory or configuration loader
 has stateful risk, exercise nominal, changed, then nominal values in one process
@@ -94,14 +95,14 @@ short list proves only what that list measured.
 
 | Requirement | Evidence |
 | --- | --- |
-| Sound geometry | Expected solid count, `inspect validate`, positive finite volume |
+| Sound geometry | Expected solid count, `topology_errors` and `boundary_edges` with no findings, positive finite volume per solid |
 | Correct size and position | Bounds, named datums, and required dimensions in the stated frame |
 | Pocket or through-hole | Empty passage at the intended position and full depth, plus surrounding material |
 | Assembly clearance | Pairwise shared volume and measured minimum distance at every required state |
-| Mating interface | Targeted `measure`, `align`, and `frame` results |
+| Mating interface | Measured offsets, axes, and `closest_points` distances between the selected datums |
 | Interchangeability | Bidirectional rotated or mirrored residual and matching functional interfaces |
 | Regeneration | Nominal, changed, then nominal factory inputs yield equivalent nominal geometry |
-| Unchanged unrelated geometry | A scoped `inspect diff` against the accepted document |
+| Unchanged unrelated geometry | Scoped measurements or `overlap_volume` residuals against the accepted document |
 | Delivered document | Re-open the written STEP and repeat its critical checks and snapshot review |
 
 A cylindrical surface is not proof of a through-hole. A zero cutter residual can
@@ -109,12 +110,13 @@ also come from a misplaced cutter. Check placement, depth, and expected
 surrounding material. For nested or located assemblies, preserve world
 transforms and evaluate leaf solids pairwise.
 
-For interference, a clean claim requires `ok`, `complete`, and `conclusive` to
-be true, no `errors`, and pair statistics that cover the intended parts and
-states. Empty selections, failed Boolean operations, truncated pairs, invalid or
-nonfinite results, and untested operating states are incomplete evidence, not
-zero interference. Choose tolerances from the part scale and required
-clearance; the default volume tolerance can hide a small but important clash.
+For interference, a clean claim requires every intended pair to be measured
+with `overlap_volume` at every required state, with no raised `GeometryError`
+and a tested-pair count that matches the intended parts. Empty selections,
+failed Boolean operations, pairs skipped or not reached, invalid or nonfinite
+results, and untested operating states are incomplete evidence, not zero
+interference. Choose the volume limit from the part scale and required
+clearance; a loose limit can hide a small but important clash.
 
 Record each project-specific check with a unique name, measured value, units,
 expectation, status (`PASS`, `FAIL`, or `INCOMPLETE`), and evidence. A

@@ -1,140 +1,169 @@
-"""The snapshot CLI and the viewer must agree about what a theme IS.
-
-They cannot share a constant -- one is Python, the other JavaScript -- so they agree by
-this test instead. It reads the viewer's own preset table and asserts the Python side
-knows the same ids.
-
-This is not hypothetical. `WORKBENCH_RENDER_THEME_IDS` once named an id the viewer's
-preset table did not, while missing the presets it did have (`workbench-light` and
-`workbench-dark`). The PICTURE was right -- but that set also decides a render's default
-dimensions, so asking for the viewer's real preset by name rendered at 1200x900 where the
-stale id rendered at 1600x1200. Identical theme, different image, no warning.
-"""
-
+"""Behavioral parity for the shared Viewer and Python snapshot display schema."""
 from __future__ import annotations
 
-import re
+import json
+import subprocess
 import unittest
 from pathlib import Path
 
 from tests.python.support.paths import add_repo_path, repo_path
 
 add_repo_path("packages/cadgen/src")
-
-from cadgen.snapshot_core import (  # noqa: E402
-    DEFAULT_RENDER_THEME_ID,
-    DISPLAY_OPTION_KEYS,
-    VIEWER_DEFAULT_THEME_ID,
-    WORKBENCH_RENDER_THEME_IDS,
+from cadgen.snapshot_core import (
+    CAMERA_OPTION_KEYS, DISPLAY_GROUP_KEYS, DISPLAY_MODES, DISPLAY_OPTION_KEYS,
+    DISPLAY_SURFACE_STYLES, PART_COLOR_MODES, SnapshotError,
+    load_display_option, normalize_common_job, validate_camera_option,
+    validate_display_settings_values,
 )
 
-THEME_SETTINGS_JS = Path(repo_path("packages/cadgen-js/src/common/themeSettings.js"))
-DISPLAY_SETTINGS_JS = Path(repo_path("packages/cadgen-js/src/common/displaySettings.js"))
+VIEW = repo_path("packages/core/src/common/viewSettings.js")
+SCENE = repo_path("packages/core/src/common/sceneSettings.js")
+CAMERA = repo_path("packages/core/src/common/camera.js")
+VALIDATOR = repo_path("packages/core/src/common/snapshotJobValidation.js")
 
 
-def _js_source() -> str:
-    return THEME_SETTINGS_JS.read_text(encoding="utf-8")
+def javascript(expression: str, payload=None):
+    script = f"""
+import fs from "node:fs";
+import * as view from {json.dumps(VIEW.as_uri())};
+import * as scene from {json.dumps(SCENE.as_uri())};
+import {{ CAMERA_SPEC_KEYS, normalizeCameraSpec }} from {json.dumps(CAMERA.as_uri())};
+import {{ validateSnapshotRenderJob }} from {json.dumps(VALIDATOR.as_uri())};
+const cases = JSON.parse(fs.readFileSync(0, "utf8"));
+const accepts = fn => {{ try {{ fn(); return true; }} catch {{ return false; }} }};
+console.log(JSON.stringify({expression}));
+"""
+    completed = subprocess.run(["node", "--input-type=module", "-e", script],
+                               input=json.dumps(payload), text=True, capture_output=True,
+                               check=True, cwd=repo_path())
+    return json.loads(completed.stdout)
 
 
-def _cadgen_js_declares_theme_settings() -> bool:
-    # The module below must declare the presets itself rather than forward to somewhere
-    # else. If they ever move, this guard moves with them rather than quietly comparing
-    # against a module the viewer no longer loads.
-    source = _js_source()
-    return "export const THEME_PRESETS" in source
+def python_accepts(values, validator):
+    result = []
+    for value in values:
+        try:
+            validator(value)
+        except SnapshotError:
+            result.append(False)
+        else:
+            result.append(True)
+    return result
 
 
-def _preset_ids() -> set[str]:
-    """Every id in the viewer's THEME_PRESETS table."""
-    source = _js_source()
-    start = source.index("export const THEME_PRESETS")
-    end = source.index("export const DEFAULT_THEME_PRESET_ID", start)
-    return set(re.findall(r'id:\s*"([^"]+)"', source[start:end]))
+class SharedDisplayContractParityTests(unittest.TestCase):
+    def test_exported_closed_key_sets_and_enums_match(self):
+        expected = {
+            "VIEW_PRESET_VALUES": DISPLAY_MODES,
+            "VIEW_SETTINGS_KEYS": DISPLAY_OPTION_KEYS,
+            "VIEW_SURFACE_STYLE_VALUES": DISPLAY_SURFACE_STYLES,
+            "VIEW_COLOR_MODE_VALUES": PART_COLOR_MODES,
+            **{f"VIEW_{name.upper()}_KEYS": keys for name, keys in DISPLAY_GROUP_KEYS.items()
+               if name not in {"clip", "exploded"}},
+        }
+        actual = javascript("Object.fromEntries(cases.map(key => [key, view[key]]))", list(expected))
+        for name, values in expected.items():
+            with self.subTest(export=name):
+                self.assertEqual(set(actual[name]), set(values))
 
+    def test_display_values_match_in_both_languages(self):
+        valid = [
+            {}, *({"mode": mode} for mode in DISPLAY_MODES),
+            {"appearance": "dark"},
+            *({group: {}} for group in DISPLAY_GROUP_KEYS),
+            *({group: {"enabled": False}} for group in DISPLAY_GROUP_KEYS),
+            {"camera": {"projection": "perspective", "focalLength": 20}},
+            {"camera": {"projection": "orthographic", "focalLength": 200}},
+            {"surfaces": {"style": "flat", "colorMode": "by-part", "colors": ["#aBc", "#123456"], "opacity": 0}},
+            {"lighting": {"quality": "preview", "exposure": -5, "rotation": -180, "size": 0.25, "fill": 0}},
+            {"lighting": {"quality": "final", "exposure": 5, "rotation": 180, "size": 3, "fill": 1}},
+            {"background": {"opacity": 0.35}}, {"edges": {"visibility": "all", "color": "#fff"}},
+            {"floor": {"placement": "lowest", "opacity": 1}},
+            {"floor": {"finish": "glossy"}}, {"floor": {"placement": "origin", "finish": "matte"}},
+            {"clip": {"enabled": True, "axis": "y", "offset": 0.5, "offsets": {"x": 0, "y": 1}, "invert": False}},
+            {"exploded": {"enabled": True, "amount": 1}},
+        ]
+        invalid = [
+            None, [], True, "solid", {"render": {}}, {"guides": {}}, {"partColor": {}},
+            *({"mode": value} for value in (None, [], {}, True, "", "SOLID", "shaded", "hidden_line")),
+            *({"appearance": value} for value in (None, [], {}, True, "system")),
+            *({group: value} for group in DISPLAY_GROUP_KEYS for value in (None, [], True, "off", {"typo": 1}, {"enabled": 0})),
+            *({"camera": {"focalLength": value}} for value in (None, "50", True, 19.9, 200.1)),
+            *({"surfaces": {"colors": value}} for value in (None, [], "#fff", ["white"], ["#fff"] * 51)),
+            {"surfaces": {"colorMode": "by_part"}}, {"surfaces": {"style": "solid"}},
+            {"surfaces": {"opacity": 1.01}}, {"surfaces": {"opacity": True}},
+            {"edges": {"visibility": "hidden"}}, {"edges": {"silhouette": True}},
+            {"lighting": {"quality": None}}, {"lighting": {"exposure": -5.01}},
+            {"lighting": {"rotation": -180.1}}, {"lighting": {"size": 0.24}},
+            {"lighting": {"fill": "0.5"}}, {"floor": {"placement": "auto"}},
+            {"floor": {"finish": "shiny"}}, {"floor": {"finish": True}},
+            {"background": {"opacity": -0.1}}, {"background": {"color": "white"}},
+            {"clip": {"axis": "w"}}, {"clip": {"offsets": {"w": 0.5}}},
+            {"clip": {"offsets": None}}, {"exploded": {"amount": 1.01}},
+        ]
+        cases = valid + invalid
+        python = python_accepts(cases, lambda value: validate_display_settings_values(value, source_label="parity"))
+        shared = javascript("cases.map(value => accepts(() => view.normalizeViewSettings(value)))", cases)
+        for index, value in enumerate(cases):
+            with self.subTest(value=value):
+                self.assertEqual(index < len(valid), python[index])
+                self.assertEqual(python[index], shared[index])
 
-def _viewer_default_preset_id() -> str:
-    match = re.search(r'export const DEFAULT_THEME_PRESET_ID\s*=\s*"([^"]+)"', _js_source())
-    assert match, "themeSettings.js no longer declares DEFAULT_THEME_PRESET_ID"
-    return match.group(1)
+    def test_python_packets_resolve_to_the_same_preset_and_overrides(self):
+        cases = [
+            {}, {"mode": "render"}, {"mode": "xray"}, {"mode": "hidden-line"}, {"mode": "wireframe"},
+            {"mode": "solid", "lighting": {"exposure": 1}},
+            {"mode": "render", "floor": {"enabled": False}, "background": {"opacity": 0.35}},
+            {"mode": "render", "camera": {"projection": "orthographic"}, "grid": {"color": "#abc"}},
+            {"mode": "render", "floor": {"finish": "glossy"}},
+        ]
+        packets = [normalize_common_job({"input": "part.step", "outputs": [{"path": "out.png"}], "display": value},
+                                      mode="view", resolved_cwd=Path("."), timestamp="parity")["display"] for value in cases]
+        expected = javascript("cases.map(value => view.resolveViewSettings(value))", cases)
+        actual = javascript("cases.map(value => view.resolveViewSettings(value))", packets)
+        self.assertEqual(expected, actual)
+        self.assertEqual("perspective", actual[1]["camera"]["projection"])
+        self.assertEqual("orthographic", actual[0]["camera"]["projection"])
+        self.assertTrue(actual[5]["lighting"]["enabled"])
+        self.assertFalse(actual[6]["floor"]["enabled"])
+        self.assertEqual(0.35, actual[6]["background"]["opacity"])
+        self.assertTrue(actual[7]["grid"]["enabled"])
+        self.assertEqual("#aabbcc", actual[7]["grid"]["color"])
+        self.assertEqual("matte", actual[1]["floor"]["finish"])
+        self.assertEqual("glossy", actual[8]["floor"]["finish"])
 
+    def test_a_render_snapshot_stands_its_floor_where_the_viewer_does(self):
+        # `--display render` as the CLI reads it, with no floor placement given; then Model origin
+        # chosen; then a floor turned on by hand in Solid.
+        cases = [dict(load_display_option("render", cwd=Path("."))),
+                 {"mode": "render", "floor": {"placement": "origin"}},
+                 {"mode": "solid", "floor": {}}]
+        packets = [normalize_common_job({"input": "part.step", "outputs": [{"path": "out.png"}], "display": value},
+                                        mode="view", resolved_cwd=Path("."), timestamp="parity")["display"] for value in cases]
+        # Where the Viewer's Display puts the floor, whether it reads as Custom, and where the scene
+        # the snapshot's page renders (`resolveViewSceneSettings`) hands the studio its floor.
+        read = "cases.map(value => [view.resolveViewSettings(value).floor.placement, view.viewSettingsAreCustom(value), " \
+               "scene.resolveViewSceneSettings({ display: value }).render.configuration.backdrop.groundPlacement])"
+        viewer, snapshot = javascript(read, cases), javascript(read, packets)
+        self.assertEqual(viewer, snapshot)
+        self.assertEqual([["lowest", False, "lowest"], ["origin", True, "origin"]], snapshot[:2])
+        self.assertEqual("origin", snapshot[2][0])
 
-def _viewer_display_keys() -> set[str]:
-    """The top-level settings in the viewer's Display tab."""
-    source = DISPLAY_SETTINGS_JS.read_text(encoding="utf-8")
-    start = source.index("export const DEFAULT_DISPLAY_SETTINGS")
-    end = source.index("});", start)
-    return set(re.findall(r"^\s*(\w+):", source[start:end], flags=re.MULTILINE))
+    def test_public_camera_keys_match_the_shared_pose_fields(self):
+        self.assertEqual(set(javascript('CAMERA_SPEC_KEYS.filter(key => !["projection", "focalLength"].includes(key))')), set(CAMERA_OPTION_KEYS))
 
-
-class DisplayParityTests(unittest.TestCase):
-    """`--display` is meant to be ALL of the viewer's Display tab in one option. A setting
-    the viewer grows and the CLI cannot express is the failure this catches."""
-
-    def test_every_viewer_display_setting_is_expressible(self):
-        missing = _viewer_display_keys() - DISPLAY_OPTION_KEYS
-        self.assertEqual(
-            set(),
-            missing,
-            f"the viewer's Display tab has {sorted(missing)}, which --display cannot carry",
-        )
-
-    def test_it_accepts_nothing_the_viewer_does_not_have(self):
-        # `projection` is the deliberate exception: it is a THEME trait that --display may
-        # override for a one-off render, which the CLI help states.
-        extra = DISPLAY_OPTION_KEYS - _viewer_display_keys() - {"projection"}
-        self.assertEqual(set(), extra, f"--display accepts unknown key(s): {sorted(extra)}")
-
-
-class ThemeParityTests(unittest.TestCase):
-    def test_the_viewer_still_loads_the_shared_theme_source(self):
-        # The parity checks below read cadgen-js's declarations because that is where they
-        # live now; this keeps the viewer's consumption path honest.
-        self.assertTrue(
-            _cadgen_js_declares_theme_settings(),
-            "cadgen-js/common/themeSettings.js no longer declares the theme presets itself",
-        )
-
-    def test_the_snapshot_default_is_the_render_only_snapshot_theme(self):
-        self.assertEqual("snapshot", DEFAULT_RENDER_THEME_ID)
-
-    def test_the_snapshot_theme_is_not_offered_in_the_viewer(self):
-        # It exists for headless renders. Putting a theme with no grid and no origin axis
-        # in the picker would hand it to someone who wants both.
-        self.assertNotIn(DEFAULT_RENDER_THEME_ID, _preset_ids())
-
-    def test_the_snapshot_theme_id_the_cli_names_is_the_one_js_declares(self):
-        # Behaviour (what the theme actually renders) is asserted in cadgen-js's own suite;
-        # what this side can check is that the two agree on the id at all.
-        match = re.search(r'export const SNAPSHOT_THEME_ID\s*=\s*"([^"]+)"', _js_source())
-        self.assertIsNotNone(match, "themeSettings.js no longer declares SNAPSHOT_THEME_ID")
-        self.assertEqual(match.group(1), DEFAULT_RENDER_THEME_ID)
-        self.assertIn("RENDER_ONLY_THEME_PRESETS", _js_source())
-
-    def test_the_theme_it_derives_from_is_the_viewers_default(self):
-        # `snapshot` is Workbench Light minus its furniture. If the viewer changes which
-        # preset it opens with, the derivation is the thing to revisit.
-        self.assertEqual(_viewer_default_preset_id(), VIEWER_DEFAULT_THEME_ID)
-        self.assertIn(VIEWER_DEFAULT_THEME_ID, _preset_ids())
-
-    def test_every_workbench_preset_counts_as_the_workbench_theme(self):
-        # This set decides default render dimensions. A workbench preset missing from it
-        # renders at a different size than its siblings for no stated reason.
-        workbench_presets = {pid for pid in _preset_ids() if pid.startswith("workbench")}
-        self.assertTrue(workbench_presets, "the viewer has no workbench presets to compare")
-        missing = workbench_presets - WORKBENCH_RENDER_THEME_IDS
-        self.assertEqual(
-            set(),
-            missing,
-            f"viewer workbench preset(s) {sorted(missing)} are not in "
-            "WORKBENCH_RENDER_THEME_IDS, so they render at a different default size",
-        )
-
-    def test_it_claims_no_id_the_viewer_does_not_have(self):
-        # An id the viewer cannot resolve would be a typo that silently changes
-        # a render's size. `snapshot` is the render-only theme, declared outside
-        # THEME_PRESETS by design.
-        unknown = WORKBENCH_RENDER_THEME_IDS - _preset_ids() - {"snapshot"}
-        self.assertEqual(set(), unknown, f"unknown theme id(s): {sorted(unknown)}")
+    def test_camera_pose_and_projection_have_one_home(self):
+        cases = [
+            {"preset": "front"}, {"orthographicHalfHeight": 12},
+            {"position": [1, 2, 3], "target": [0, 0, 0]},
+            {"projection": "orthographic"}, {"focalLength": 85},
+            {"position": [1, 2, "3"]}, {"up": None}, {"direction": [0, 0, 0]},
+            {"zoom": "2"}, {"orthographicHalfHeight": False}, {"typo": 1},
+        ]
+        python = python_accepts(cases, lambda value: validate_camera_option(value, source_label="parity"))
+        shared = javascript("cases.map(camera => accepts(() => { validateSnapshotRenderJob({camera}); normalizeCameraSpec(camera, {strict:true}); }))", cases)
+        self.assertEqual([True] * 3 + [False] * 8, python)
+        self.assertEqual(python, shared)
 
 
 if __name__ == "__main__":

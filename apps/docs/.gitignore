@@ -12,3 +12,6 @@ coverage/
 
 # Local env
 .env*.local
+
+# Generated from src/lib/icon/model.mjs before dev/build
+/public/icon/icon.glb

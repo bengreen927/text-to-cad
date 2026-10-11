@@ -26,31 +26,46 @@ from tests.python.support.paths import REPO_ROOT, add_repo_path
 add_repo_path("packages/cadgen/src")
 
 from cadgen._internal.glb_topology import STEP_TOPOLOGY_SCHEMA_VERSION
-from cadgen._internal.cache_schema import CACHE_SCHEMA_VERSION
 
 ROOT = REPO_ROOT
 
 
 class TopologySchemaVersionMirrorTest(unittest.TestCase):
     def test_python_and_js_declare_the_same_topology_schema_version(self) -> None:
-        source = (ROOT / "packages/cadgen-js/src/common/stepTopology.mjs").read_text(encoding="utf-8")
+        source = (ROOT / "packages/core/src/common/stepTopology.mjs").read_text(encoding="utf-8")
         match = re.search(r"STEP_TOPOLOGY_SCHEMA_VERSION\s*=\s*(\d+)", source)
-        self.assertIsNotNone(match, "cadgen-js must declare STEP_TOPOLOGY_SCHEMA_VERSION")
+        self.assertIsNotNone(match, "@text-to-cad/core must declare STEP_TOPOLOGY_SCHEMA_VERSION")
         self.assertEqual(
             STEP_TOPOLOGY_SCHEMA_VERSION,
             int(match.group(1)),
-            "cadgen and cadgen-js disagree on STEP_topology schemaVersion; the JS client throws "
+            "cadgen and @text-to-cad/core disagree on STEP_topology schemaVersion; the JS client throws "
             "on a mismatch, so a bump has to land in both languages together",
         )
 
 
 class PackageVersionIsOneNumberPerFileTypeTest(unittest.TestCase):
-    def test_the_step_cid_salt_is_the_cache_schema_version_itself(self) -> None:
-        # Not merely equal to it: the same constant. A separate payload version is the
-        # split this rule exists to prevent.
+    def test_the_step_cid_salt_is_one_constant_that_re_keys_every_component(self) -> None:
+        # ONE number, and moving it moves every component id. A second version
+        # beside it is the split this rule exists to prevent: a descriptor bump
+        # could then ship without re-emitting the payloads it describes.
+        from unittest import mock
+
         from cadgen._internal import component_package
 
-        self.assertIs(component_package.CACHE_SCHEMA_VERSION, CACHE_SCHEMA_VERSION)
+        def component_id() -> str:
+            return component_package.geometry_component_hash("bintools-v4", b"brep", {})
+
+        before = component_id()
+        with mock.patch.object(
+            component_package, "GEOMETRY_SCHEME", component_package.GEOMETRY_SCHEME + "-next"
+        ):
+            after = component_id()
+        self.assertNotEqual(
+            before,
+            after,
+            "the component id salt must reach the hash, or bumping the extraction scheme "
+            "would leave every stale component readable under its old key",
+        )
 
     def test_no_separate_payload_version_has_reappeared(self) -> None:
         source = (
@@ -59,28 +74,27 @@ class PackageVersionIsOneNumberPerFileTypeTest(unittest.TestCase):
         self.assertNotIn(
             "COMPONENT_PAYLOAD_VERSION",
             source,
-            "the component payload version was folded into CACHE_SCHEMA_VERSION; a second "
+            "the component payload version was folded into the component id salt; a second "
             "number lets a descriptor bump ship without re-emitting the payloads",
         )
 
     def test_each_file_type_keeps_its_own_cache_key(self) -> None:
         # Deliberately NOT one shared number: a drawing rebuild is milliseconds and a
         # large STEP assembly is tens of seconds, so a DXF change must not re-mesh every
-        # STEP model on next open. The gate lives in the store KEY salt now
-        # (the component id salt in component_package._content_hash_and_bytes),
-        # not in a descriptor check: a version bump re-keys every component.
-        source = (ROOT / "packages/cadgen/src/cadgen/_internal/component_package.py").read_text(encoding="utf-8")
+        # STEP model on next open. The gate lives in the store KEY salt
+        # (component_package.GEOMETRY_SCHEME, reached through
+        # component_package._content_hash_and_bytes), not in a descriptor check:
+        # a version bump re-keys every component.
+        from cadgen._internal import component_package
+
         # DXF is absent by design: a generated drawing's render IS the sibling
         # .dxf the client parses, so there is no artifact to gate.
-        for constant in (
-            "CACHE_SCHEMA_VERSION",
-        ):
-            self.assertIn(
-                constant,
-                source,
-                f"the store key salt must carry {constant} so that file type invalidates "
-                "independently of the others",
-            )
+        self.assertIsInstance(component_package.GEOMETRY_SCHEME, str)
+        self.assertTrue(
+            component_package.GEOMETRY_SCHEME.strip(),
+            "the STEP component key needs its own salt so that file type invalidates "
+            "independently of the others",
+        )
 
 
 class DeadVersionsStayDeadTest(unittest.TestCase):
@@ -89,17 +103,6 @@ class DeadVersionsStayDeadTest(unittest.TestCase):
     A number nobody checks is not a contract; it is a value that looks load-bearing
     and invites a reader to reason about compatibility that was never enforced.
     """
-
-    def test_dxf_render_schema_version_is_gone_from_both_languages(self) -> None:
-        for relative in (
-            "packages/cadgen/src/cadgen/drawing_render.py",
-            "packages/cadgen-js/src/lib/dxf/parseDxf.js",
-        ):
-            self.assertNotIn(
-                "DXF_RENDER_SCHEMA_VERSION",
-                (ROOT / relative).read_text(encoding="utf-8"),
-                f"{relative} stamped a version nothing ever read",
-            )
 
     def test_viewer_server_info_schema_version_is_gone(self) -> None:
         self.assertNotIn(

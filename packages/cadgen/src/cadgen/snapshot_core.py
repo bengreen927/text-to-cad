@@ -1,7 +1,7 @@
 """Snapshot render core shared by the CAD and DXF skills.
 
 Everything here is format-agnostic: the headless browser driver, the job normalisation
-(camera, theme, display, size profile), the mesh render path, and output writing. It
+(camera, Render scene, display, output, quality), the mesh render path, and output writing. It
 knows nothing about STEP topology, drawings, or robot descriptions -- a caller resolves its
 own input to an asset URL and hands the result to :func:`render_resolved_job_packet`.
 
@@ -10,15 +10,16 @@ import another skill's code (AGENTS.md). It was extracted verbatim from the CAD 
 snapshot CLI, which remains its largest caller and keeps every STEP-specific resolver.
 
 The one thing the core cannot know is where the browser runtime (render.html and
-snapshot-render.js) lives: each skill bundles its own copy. So `runtime_dir` is passed in
-by the caller rather than derived here.
+snapshot-render.js) lives: a caller may point at a directory of its own. So `runtime_dir`
+is passed in rather than derived here, and it is validated once, when the renderer starts,
+by :func:`cadgen.assets.require_browser_runtime` -- an absent bundle is a message naming
+how to produce it rather than a 404 inside a headless page.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
-import copy
 import json
 import mimetypes
 import os
@@ -29,48 +30,46 @@ import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from hashlib import sha256
+from math import isfinite
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from cadgen.assets import require_browser_runtime
 from cadgen.coordination import PHASE_RENDER, resolve as resolve_progress
 from cadgen.results import SnapshotFile, SnapshotResult, SnapshotTimings
-from cadgen._internal.atomic_replace import replace_atomic, write_bytes_atomic
+from cadgen._internal.atomic_replace import write_bytes_atomic
 
 
-SNAPSHOT_ORIGIN = "http://snapshot.local"
+# `localhost` is a potentially trustworthy origin under the Secure Contexts
+# rules even over HTTP. The page is still entirely intercepted below; this
+# spelling gives its shared TESS provider the SubtleCrypto object required to
+# verify immutable cache bodies before use.
+SNAPSHOT_ORIGIN = "http://localhost"
 SNAPSHOT_RENDER_URL = f"{SNAPSHOT_ORIGIN}/render.html"
 SNAPSHOT_ROUTE_GLOB = f"{SNAPSHOT_ORIGIN}/**"
-# A snapshot is usually READ by an agent rather than looked at by a person, so it does not
-# default to a viewer theme at all: `snapshot` is Workbench Light with the ground grid and
-# origin axis removed (themeSettings.js RENDER_ONLY_THEME_PRESETS). Those two are helpful
-# orientation in a live viewport and are geometry-shaped contrast in a still image --
-# straight low-contrast lines crossing the model, indistinguishable from a silhouette edge.
-# Materials, lighting and background are Workbench Light unchanged, so parts read exactly as
-# they do in the viewer.
-DEFAULT_RENDER_THEME_ID = "snapshot"
-# The viewer theme `snapshot` is derived from, and the id its default dimensions follow.
-VIEWER_DEFAULT_THEME_ID = "workbench-light"
+# Display is a sparse preset override. The shared browser resolver owns defaults.
+DISPLAY_APPEARANCES = frozenset({"light", "dark"})
+RENDER_QUALITY_IDS = frozenset({"preview", "final"})
 DEFAULT_TIMEOUT_SECONDS = 300
+# Tearing a video sequence down is one dispose call over objects already in
+# hand, so it gets a short deadline of its own rather than the job's: the
+# failure it is bounded against is a frame that already blew ITS timeout and
+# left JavaScript running, which this call would then queue behind forever.
+VIDEO_TEARDOWN_TIMEOUT_SECONDS = 30
+# How often a video says where it is when nothing is painting a progress bar.
+VIDEO_NARRATE_INTERVAL_SECONDS = 15.0
 RENDER_BROWSER_STARTUP_TIMEOUT_MS = 15_000
 SUPPORTED_RENDER_MODES = {"view", "section", "list"}
-MESH_INPUT_KINDS = {"glb", "stl", "3mf"}
 MESH_SUPPORTED_RENDER_MODES = {"view", "list"}
-TOPOLOGY_DISPLAY_MODES = {"hidden_edges", "hidden_lines_removed"}
-# Every id that IS the workbench theme, because this set decides a render's default
-# dimensions (see default_render_size). A workbench preset missing from it silently
-# renders at 1200x900 instead of 1600x1200 despite resolving to the identical theme in
-# the browser. Pinned against the viewer's preset table by
-# tests/python/global/test_snapshot_viewer_theme_parity.py.
-WORKBENCH_RENDER_THEME_IDS = {"snapshot", "workbench-light", "workbench-dark"}
 SUPPORTED_JOB_KEYS = frozenset(
     {
         "input",
         "mode",
         "outputs",
-        "theme",
         "display",
-        "render",
+        "output",
+        "quality",
         "camera",
         "selection",
         # A STEP model's pose: a declared preset name, or {dof: value}. Named for the
@@ -81,116 +80,219 @@ SUPPORTED_JOB_KEYS = frozenset(
         # angle, so it gets its own key rather than overloading one that means a sidecar.
         "jointValues",
         # One frozen frame of a STEP document's choreography: {"clip": name,
-        # "time": seconds}. The clips come from the render module beside the
-        # document (<name>.step.js); spelled the same as the --animation flag.
+        # "time": seconds}. The clips come from animation.source in the document sidecar;
+        # spelled the same as the --animation flag.
         # Layered over the kinematics pose exactly as the viewer layers its
         # Animation tab.
         "animation",
-        "sizeProfile",
-        "width",
-        "height",
+        # The SPAN of that choreography rather than one moment of it:
+        # {fps, seconds, start, quality, loop}, encoded to the .mp4/.gif the
+        # output names. Meaningless without `animation` (cadgen.snapshot_video).
+        "video",
+        # Where `mode: "section"` cuts: {"plane": "XY"|"XZ"|"YZ", "offset": <model
+        # units along the plane's normal>}. Spelled the same as the --section flag.
+        "section",
         "scale",
-        "sceneScale",
         "debug",
         "timeoutSeconds",
     }
 )
+SUPPORTED_OUTPUT_SETTINGS_KEYS = frozenset(
+    {"sizeProfile", "padding", "viewLabels", "tightFrame", "transparent", "renderScale"}
+)
+# One name per setting: a key that used to be accepted names its replacement.
+RETIRED_OUTPUT_SETTINGS_KEYS = {"paddingPercent": "padding"}
+# The ranges the renderer honours (renderOptions.js framePadding and
+# configurePngRenderer clamp to exactly these). A value outside one used to be
+# clamped in the page without a word, so it is refused here instead.
+OUTPUT_PADDING_RANGE = (0, 0.15)
+OUTPUT_RENDER_SCALE_RANGE = (1, 3)
+SUPPORTED_QUALITY_KEYS = frozenset({"tessellation"})
+# Floors for `quality.tessellation`. Chord tolerance is RELATIVE to each
+# component's bounding diagonal and angle tolerance is radians, so these are
+# ~100x finer than the tessellator's defaults (1.5e-3 / 0.35 rad) and past any
+# display need at any output size. Below them the page tessellates until the
+# renderer dies, and the caller sees a lost Playwright driver connection rather
+# than a rejected request — so the request is rejected here, before a browser
+# is launched. Mirrored as RENDER_TESSELLATION_FLOORS in
+# packages/core/src/common/source.js (that file validates the same job in
+# the page; the parity is tested).
+MIN_RENDER_TESSELLATION = {"chordTolerance": 1e-5, "angleTolerance": 5e-3}
 SUPPORTED_OUTPUT_KEYS = frozenset(
     {
         "path",
         "width",
         "height",
-        "sizeProfile",
         "camera",
         "label",
         "viewLabel",
-        "dataUrl",
-        "text",
     }
 )
-SIMPLE_RENDER_WIDTH = 1200
-SIMPLE_RENDER_HEIGHT = 900
-SIMPLE_SQUARE_RENDER_WIDTH = 1024
-SIMPLE_SQUARE_RENDER_HEIGHT = 1024
-DIAGNOSTIC_RENDER_WIDTH = 1600
-DIAGNOSTIC_RENDER_HEIGHT = 1200
-COMPLEX_ASSEMBLY_RENDER_WIDTH = 1800
-COMPLEX_ASSEMBLY_RENDER_HEIGHT = 1200
-COMPLEX_ASSEMBLY_LARGE_RENDER_WIDTH = 1920
-COMPLEX_ASSEMBLY_LARGE_RENDER_HEIGHT = 1440
-PRESENTATION_RENDER_WIDTH = 2400
-PRESENTATION_RENDER_HEIGHT = 1600
-PRESENTATION_LARGE_RENDER_WIDTH = 2800
-PRESENTATION_LARGE_RENDER_HEIGHT = 1800
-CONTACT_SHEET_RENDER_WIDTH = 2400
-CONTACT_SHEET_RENDER_HEIGHT = 1600
-DISPLAY_OPTION_KEYS = {"projection", "mode", "clip", "exploded", "edges"}
-DISPLAY_MODE_ALIASES = {
-    "solid": "solid",
-    "edges": "solid",
-    "edge": "solid",
-    "shaded_edges": "solid",
-    "shaded_with_edges": "solid",
-    "with_edges": "solid",
-    "shaded": "rendered",
-    "shaded_without_edges": "rendered",
-    "without_edges": "rendered",
-    "transparent": "transparent",
-    "translucent": "transparent",
-    "xray": "transparent",
-    "x_ray": "transparent",
-    "see_through": "transparent",
-    "hidden_edges": "hidden_edges",
-    "hidden_edge": "hidden_edges",
-    "hidden_edges_visible": "hidden_edges",
-    "hidden_edge_display": "hidden_edges",
-    "shaded_hidden_edges": "hidden_edges",
-    "hidden_lines_removed": "hidden_lines_removed",
-    "hidden_line_removed": "hidden_lines_removed",
-    "hidden_lines": "hidden_lines_removed",
-    "hidden_edges_removed": "hidden_lines_removed",
-    "visible_edges": "hidden_lines_removed",
-    "visible_edges_only": "hidden_lines_removed",
-    "unshaded": "unshaded",
-    "flat": "unshaded",
-    "rendered": "rendered",
-    "theme": "rendered",
-    "material": "rendered",
-    "materials": "rendered",
-    "wireframe": "wireframe",
-    "wire_frame": "wireframe",
-    "wire": "wireframe",
+# What the RENDERER puts on a finished output. A request that carries one is
+# confusing a result for a job, so it is refused by name rather than as a typo.
+RESULT_ONLY_OUTPUT_KEYS = frozenset({"dataUrl", "text", "mimeType"})
+# The closed set of size profiles: the names `--help` and the skill docs list.
+SIZE_PROFILES: dict[str, tuple[int, int]] = {
+    "simple": (1200, 900),
+    "simple-square": (1024, 1024),
+    "diagnostic": (1600, 1200),
+    "labeled": (1600, 1200),
+    "assembly": (1800, 1200),
+    "assembly-large": (1920, 1440),
+    "presentation": (2400, 1600),
+    "presentation-large": (2800, 1800),
+    "contact-sheet": (2400, 1600),
 }
-THEME_OPTION_KEYS = {
-    "materials",
-    "background",
-    "floor",
-    "environment",
-    "lighting",
-    "colorMode",
-    "projection",
-    # normalizeThemeSettings() emits modeColors unconditionally, so it is part
-    # of the settings shape by construction. Rejecting it meant the repo's own
-    # cloneThemePresetSettings() output could not be passed back to
-    # --theme without hand-stripping a key first.
-    "modeColors",
+# What a snapshot is sized as when it names no profile and no width/height.
+DEFAULT_SIZE_PROFILE = "diagnostic"
+# Names that used to be accepted for the same sizes. One name per profile; an old
+# one is refused with the name that replaced it.
+RETIRED_SIZE_PROFILES = {
+    "square": "simple-square",
+    "simple-part": "simple",
+    "unlabeled": "simple",
+    "hero": "presentation-large",
+    "large-presentation": "presentation-large",
+    "complex-assembly": "assembly",
+    "complex-assembly-large": "assembly-large",
+    "contactsheet": "contact-sheet",
+    "dimensioned": "labeled",
+    "section": "labeled",
 }
-SETTINGS_KEY_HOMES = {
-    "edges": "display",
-    "mode": "display",
-    "exploded": "display",
-    "clip": "display",
-    "materials": "theme",
-    "background": "theme",
-    "floor": "theme",
-    "environment": "theme",
-    "lighting": "theme",
-    "colorMode": "theme",
-    "projection": "theme",
-    "modeColors": "theme",
+# The largest side an output may ask for. Past it the browser clamps the drawing
+# buffer without saying so and the file comes back a different size than was
+# requested, so the request is refused with this number instead. At the
+# photographic preset's 2x render scale this is the 16384 px renderbuffer limit.
+MAX_OUTPUT_DIMENSION = 8192
+SIMPLE_RENDER_WIDTH, SIMPLE_RENDER_HEIGHT = SIZE_PROFILES["simple"]
+# Where section mode cuts. Mirrored as SECTION_PLANES in
+# packages/core/src/common/renderMeshScene.js (the parity is tested).
+SECTION_PLANES = ("XY", "XZ", "YZ")
+SECTION_KEYS = frozenset({"plane", "offset"})
+# What an output's extension may be, per mode. The extension decides the
+# encoding; nothing in a job does.
+STILL_OUTPUT_SUFFIXES = {"view": (".png",), "section": (".png", ".svg")}
+DISPLAY_OPTION_KEYS = frozenset({
+    "mode", "appearance", "camera", "surfaces", "edges", "lighting",
+    "background", "floor", "grid", "axes", "clip", "exploded",
+})
+DISPLAY_MODES = frozenset({"solid", "render", "xray", "hidden-line", "wireframe", "grid"})
+DISPLAY_SURFACE_STYLES = frozenset({"shaded", "flat", "hidden", "off"})
+PART_COLOR_MODES = frozenset({"original", "single", "by-part"})
+DISPLAY_CAMERA_KEYS = frozenset({"enabled", "projection", "focalLength"})
+DISPLAY_SURFACE_KEYS = frozenset({"enabled", "style", "colorMode", "color", "colors", "opacity"})
+DISPLAY_EDGE_KEYS = frozenset({"enabled", "visibility", "color"})
+DISPLAY_LIGHTING_KEYS = frozenset({"enabled", "quality", "exposure", "rotation", "size", "fill"})
+DISPLAY_BACKGROUND_KEYS = frozenset({"enabled", "color", "opacity"})
+DISPLAY_FLOOR_KEYS = frozenset({"enabled", "placement", "color", "opacity", "finish"})
+# The Viewer's Floor finish: a glossy floor also reflects the model.
+DISPLAY_FLOOR_FINISHES = frozenset({"matte", "glossy"})
+DISPLAY_GRID_KEYS = frozenset({"enabled", "color", "opacity", "density"})
+DISPLAY_AXES_KEYS = frozenset({"enabled", "color", "opacity"})
+DISPLAY_CLIP_KEYS = frozenset({"enabled", "axis", "offset", "offsets", "invert"})
+DISPLAY_EXPLODED_KEYS = frozenset({"enabled", "amount"})
+DISPLAY_GROUP_KEYS = {
+    "camera": DISPLAY_CAMERA_KEYS, "surfaces": DISPLAY_SURFACE_KEYS,
+    "edges": DISPLAY_EDGE_KEYS, "lighting": DISPLAY_LIGHTING_KEYS,
+    "background": DISPLAY_BACKGROUND_KEYS, "floor": DISPLAY_FLOOR_KEYS,
+    "grid": DISPLAY_GRID_KEYS, "axes": DISPLAY_AXES_KEYS,
+    "clip": DISPLAY_CLIP_KEYS, "exploded": DISPLAY_EXPLODED_KEYS,
+}
+CAMERA_OPTION_KEYS = frozenset({
+    "preset", "name", "position", "target", "up", "direction", "zoom", "orthographicHalfHeight",
+})
+# One name per view. Mirrored as RENDER_CAMERA_PRESETS in
+# packages/core/src/common/camera.js (the parity is tested).
+CAMERA_PRESETS = frozenset({"front", "back", "right", "left", "top", "bottom", "iso"})
+RETIRED_CAMERA_PRESETS = {"isometric": "iso", "side": "right"}
+# Keys a caller reaches for inside `display` that live somewhere else.
+DISPLAY_KEY_HOMES = {
+    "projection": "display.camera", "focalLength": "display.camera",
+    "orthographicHalfHeight": "camera",
+}
+# Display groups that were replaced, and what replaced each.
+RETIRED_DISPLAY_KEYS = {
+    "render": "display.lighting, display.background and display.floor",
+    "guides": "display.grid and display.axes",
+    "partColor": "display.surfaces",
 }
 class SnapshotError(RuntimeError):
     pass
+# What a Playwright launch failure says when the browser itself is the problem, not the job:
+# its build was never downloaded (the first snapshot after an install or a Playwright bump), or
+# a Linux host lacks the system libraries it links against (a slim container).
+_BROWSER_MISSING = "Executable doesn't exist"
+_HOST_LIBRARIES_MISSING = "Host system is missing dependencies"
+
+
+def browser_problem(message: str) -> str | None:
+    """``"browser"`` (not downloaded), ``"libraries"`` (host lacks them) or ``None`` (anything else)."""
+    if _BROWSER_MISSING in message:
+        return "browser"
+    if _HOST_LIBRARIES_MISSING in message:
+        return "libraries"
+    return None
+
+
+def install_browser(problem: str) -> None:
+    """Fix ``problem`` the way Playwright documents, so the first snapshot needs no setup step.
+
+    The browser is the headless shell alone (``--only-shell``): the full Chromium beside it is
+    ~350 MB a snapshot never launches. It goes where Playwright keeps its browsers, which shares
+    it with any other Playwright install and keeps Playwright's own cleanup of old builds. The
+    host's libraries need root and apt; without them the fix is the user's to run, and this says
+    exactly which command. Progress goes to stderr: stdout is the snapshot's result.
+    """
+    import shutil
+    import subprocess
+
+    if problem == "browser":
+        sys.stderr.write("cadgen: downloading the snapshot browser (once, about 100 MB)...\n")
+        command = [sys.executable, "-m", "playwright", "install", "--only-shell", "chromium"]
+    else:
+        command = [sys.executable, "-m", "playwright", "install-deps", "chromium"]
+        root = hasattr(os, "geteuid") and os.geteuid() == 0
+        if not (sys.platform.startswith("linux") and root and shutil.which("apt-get")):
+            raise SnapshotError(
+                "The snapshot browser needs system libraries this machine does not have. "
+                f"Install them with: sudo {' '.join(command)}"
+            )
+        sys.stderr.write("cadgen: installing the snapshot browser's system libraries...\n")
+    result = subprocess.run(command, stdout=sys.stderr, stderr=sys.stderr)
+    if result.returncode != 0:
+        raise SnapshotError(f"{' '.join(command)} exited {result.returncode}; run it to see why, then retry.")
+
+
+async def launch_with_browser(launch: Any, fix: Any = install_browser) -> Any:
+    """``await launch()``, fixing a missing browser (then its libraries) and retrying.
+
+    At most one fix per problem: a launch that still fails after both is the job's real error.
+    """
+    fixed: set[str] = set()
+    while True:
+        try:
+            return await launch()
+        except Exception as error:  # noqa: BLE001 - Playwright raises its own Error for both cases
+            problem = browser_problem(str(error))
+            if problem is None or problem in fixed:
+                raise _browser_failed(error)
+            fixed.add(problem)
+            try:
+                fix(problem)
+            except Exception as unfixed:
+                raise _browser_failed(unfixed)
+
+
+def _browser_failed(error: BaseException) -> BaseException:
+    """``error``, named for telemetry as the browser that did not start (``cadgen.analytics.because``)."""
+    try:
+        from cadgen.analytics import because
+
+        return because(error, "browser")
+    except Exception:  # noqa: BLE001 - a reason never fails the failure it names
+        return error
+
+
 class RouteFileError(SnapshotError):
     def __init__(self, message: str, *, status: int = 404) -> None:
         super().__init__(message)
@@ -206,170 +308,487 @@ def load_json_text(text: str, source_label: str) -> object:
 #
 # Every option below arrives as TEXT from the CLI and has to be parsed. The public
 # `<format>.snapshot()` verbs hand the same options over as Python values -- a dict
-# for a theme, a dict for a camera -- and stringifying one of those would produce
-# "{'materials': ...}", which parses as a saved-theme NAME and silently renders the
-# default. So each loader takes the already-parsed shape as itself.
+# for display settings, a dict for a camera -- and stringifying one of those would produce
+# "{'settings': ...}", which cannot be parsed as JSON. So each loader takes the
+# already-parsed shape as itself.
+
+
+def validate_camera_name(camera: str) -> str:
+    """A camera given by NAME: one of the presets, or an ``azimuth:elevation`` pair."""
+    name = camera.strip().lower()
+    if name in CAMERA_PRESETS:
+        return camera
+    if name in RETIRED_CAMERA_PRESETS:
+        raise SnapshotError(
+            f"camera preset {camera!r} was removed; use {RETIRED_CAMERA_PRESETS[name]!r}"
+        )
+    parts = name.split(":")
+    if len(parts) >= 2:
+        try:
+            numeric = all(isfinite(float(part)) for part in parts)
+        except ValueError:
+            numeric = False
+        if numeric and len(parts) == 2:
+            return camera
+        if numeric:
+            raise SnapshotError(
+                f"camera {camera!r} names {len(parts)} numbers; an angle pair is exactly "
+                "azimuth:elevation in degrees — set distance with a camera JSON object's zoom"
+            )
+    raise SnapshotError(
+        f"Unknown camera preset: {camera}. Presets: {', '.join(sorted(CAMERA_PRESETS))}; "
+        "or an azimuth:elevation pair in degrees, or a camera JSON object"
+    )
 
 
 def parse_camera_option(raw_camera: object) -> object:
     if is_plain_object(raw_camera):
-        return raw_camera
+        return validate_camera_option(raw_camera, source_label="camera settings")
     camera = str(raw_camera or "").strip()
     if not camera:
         raise SnapshotError("--camera requires a preset, azimuth:elevation pair, or JSON camera object")
     if not camera.startswith("{"):
-        return camera
+        return validate_camera_name(camera)
     parsed = load_json_text(camera, "--camera")
     if not is_plain_object(parsed):
         raise SnapshotError("--camera must be a preset, azimuth:elevation pair, or JSON object")
-    return parsed
-def validate_direct_settings_payload(
-    parsed: object,
+    return validate_camera_option(parsed, source_label="--camera")
+
+
+def validate_camera_option(value: object, *, source_label: str) -> dict[str, object]:
+    if not is_plain_object(value):
+        raise SnapshotError(f"camera must be a preset name or camera object ({source_label})")
+    payload = dict(value)
+    moved = sorted(set(payload) & {"projection", "focalLength"})
+    if moved:
+        raise SnapshotError(
+            f"camera {', '.join(moved)} belongs in display.camera; --camera controls pose and framing"
+        )
+    unknown = sorted(set(payload) - CAMERA_OPTION_KEYS)
+    if unknown:
+        raise SnapshotError(
+            f"camera has unknown key(s): {', '.join(unknown)}; "
+            f"supported keys: {', '.join(sorted(CAMERA_OPTION_KEYS))} ({source_label})"
+        )
+    if "preset" in payload:
+        if not isinstance(payload["preset"], str) or not payload["preset"].strip():
+            raise SnapshotError(f"camera preset must be a preset name or azimuth:elevation pair ({source_label})")
+        validate_camera_name(payload["preset"])
+    for key in ("position", "target", "up", "direction"):
+        if key not in payload:
+            continue
+        vector = payload[key]
+        if not isinstance(vector, (list, tuple)) or len(vector) != 3 or any(
+            isinstance(item, bool) or not isinstance(item, (int, float)) or not isfinite(float(item))
+            for item in vector
+        ):
+            raise SnapshotError(f"camera {key} must be a three-number array ({source_label})")
+        if key in {"up", "direction"} and sum(float(item) ** 2 for item in vector) <= 1e-12:
+            raise SnapshotError(f"camera {key} must not be the zero vector ({source_label})")
+    if "zoom" in payload:
+        zoom = payload["zoom"]
+        if isinstance(zoom, bool) or not isinstance(zoom, (int, float)) or not isfinite(float(zoom)) or zoom <= 0:
+            raise SnapshotError(f"camera zoom must be a positive finite number ({source_label})")
+    if "orthographicHalfHeight" in payload:
+        half_height = payload["orthographicHalfHeight"]
+        if (
+            isinstance(half_height, bool)
+            or not isinstance(half_height, (int, float))
+            or not isfinite(float(half_height))
+            or half_height <= 0
+        ):
+            raise SnapshotError(
+                f"camera orthographicHalfHeight must be a positive finite number ({source_label})"
+            )
+    return payload
+def _display_enum(value: object, field: str, allowed: frozenset[str]) -> None:
+    if not isinstance(value, str) or value not in allowed:
+        raise SnapshotError(f"{field} must be one of: {', '.join(sorted(allowed))}; got {value!r}")
+
+
+def display_modes_for_kind(kind: str) -> frozenset[str]:
+    """The display presets an input of this kind can be given.
+
+    An error that lists modes lists THESE, so a mesh door never offers a preset it
+    is about to refuse. An unknown kind gets the full set: its own refusal comes
+    first and says what the file is. A DRAWING gets none: it has no scene for a
+    preset to configure, and its whole display is ``appearance``.
+    """
+    if kind in DRAWING_KINDS:
+        return frozenset()
+    if not kind or kind in CAD_MODEL_KINDS:
+        return DISPLAY_MODES
+    return DISPLAY_MODES - CAD_MODEL_DISPLAY_MODES
+
+
+def validate_display_settings_values(
+    payload: Mapping[str, object],
     *,
-    option_name: str,
     source_label: str,
-    allowed_keys: set[str],
-    setting_label: str,
-) -> dict[str, object]:
-    if not is_plain_object(parsed):
-        raise SnapshotError(f"{option_name} JSON must be a {setting_label} object: {source_label}")
-    # Underscore-prefixed keys are comments. JSON has none of its own, and an
-    # authored theme is exactly the kind of file that needs to explain why its
-    # numbers are what they are; rejecting `_comment` as an unsupported setting
-    # pushes that rationale out of the file.
-    payload = {key: value for key, value in parsed.items() if not str(key).startswith("_")}
-    unknown_keys = [key for key in payload if key not in allowed_keys]
-    if unknown_keys:
-        misplaced = [
-            f"{key} belongs in {SETTINGS_KEY_HOMES[key]} JSON"
-            for key in unknown_keys
-            if key in SETTINGS_KEY_HOMES
-        ]
-        detail = f"; {', '.join(misplaced)}" if misplaced else ""
-        raise SnapshotError(
-            f"{option_name} JSON must be the {setting_label} object directly; "
-            f"unsupported keys: {', '.join(unknown_keys)}{detail}"
-        )
-    if not payload:
-        raise SnapshotError(f"{option_name} JSON must include at least one {setting_label} field: {source_label}")
-    return payload
-def validate_display_settings_values(payload: Mapping[str, object], *, source_label: str) -> None:
-    """Reject typo'd closed-set display VALUES up front. The renderer silently falls back
-    to defaults on unknown projection/mode values (e.g. ``projection:"ortho"`` renders
-    perspective), so a late no-op produces a wrong image with no error — catch it here.
+    modes: frozenset[str] | None = None,
+) -> None:
+    """Validate the same closed, sparse preset overrides as the shared viewer.
 
-    Only closed-set, typo-prone fields are validated; alias-rich/coerced fields are left
-    to the renderer's lenient normalization to avoid false rejections of inputs the
-    browser accepts."""
-    # An empty/whitespace value means "unset": the renderer treats it as absent and falls
-    # back to the default (it does not error), so validating it here would be a false
-    # rejection of input the browser accepts. Only validate genuinely-present values.
-    projection = str(payload.get("projection") or "").strip().lower()
-    if projection and projection not in {"orthographic", "perspective"}:
+    Omitted groups inherit the preset. A present group implicitly enables itself;
+    merging group parameters and applying that enablement belongs to the shared
+    resolver, so this boundary preserves the caller's sparse request.
+
+    ``modes`` narrows the mode vocabulary an error LISTS to what the input's kind
+    accepts; a STEP-only mode on another kind is still refused by name, by
+    :func:`validate_display_for_kind`.
+    """
+    if not is_plain_object(payload):
+        raise SnapshotError(f"display must be a display settings object ({source_label})")
+    unknown = sorted(set(payload) - DISPLAY_OPTION_KEYS)
+    if unknown:
+        hints = [f"{key} belongs in {DISPLAY_KEY_HOMES[key]}" for key in unknown if key in DISPLAY_KEY_HOMES]
+        hints += [f"display.{key} was removed; use {RETIRED_DISPLAY_KEYS[key]}" for key in unknown if key in RETIRED_DISPLAY_KEYS]
         raise SnapshotError(
-            f"--display projection must be orthographic or perspective; "
-            f"got {payload.get('projection')!r} ({source_label})"
+            f"display has unknown key(s): {', '.join(unknown)} ({source_label})"
+            + (f"; {'; '.join(hints)}" if hints else "")
+            + f"; supported keys: {', '.join(sorted(DISPLAY_OPTION_KEYS))}"
         )
-    mode = str(payload.get("mode") or "").strip()
-    if mode:
-        normalized_mode = re.sub(r"[\s-]+", "_", mode.lower())
-        if normalized_mode not in DISPLAY_MODE_ALIASES:
-            supported = ", ".join(sorted(set(DISPLAY_MODE_ALIASES.values())))
-            raise SnapshotError(
-                f"--display mode must be one of: {supported}; got {payload.get('mode')!r} ({source_label})"
-            )
-    exploded = payload.get("exploded")
-    if is_plain_object(exploded):
-        # The exploded view is enabled + amount only; the layout is automatic.
-        # Any other key is a typo or a retired step-document/auto-hint field the
-        # renderer now ignores entirely — reject loudly instead of rendering a
-        # default the caller did not ask for.
-        unknown = sorted(set(exploded) - {"enabled", "amount"})
+    if "mode" in payload:
+        mode = payload["mode"]
+        if not (isinstance(mode, str) and mode in DISPLAY_MODES):
+            _display_enum(mode, "display.mode", modes or DISPLAY_MODES)
+    if "appearance" in payload:
+        _display_enum(payload["appearance"], "display.appearance", DISPLAY_APPEARANCES)
+    for name, keys in DISPLAY_GROUP_KEYS.items():
+        if name not in payload:
+            continue
+        value = payload[name]
+        if not is_plain_object(value):
+            raise SnapshotError(f"display.{name} must be an object ({source_label})")
+        unknown = sorted(set(value) - keys)
         if unknown:
-            raise SnapshotError(
-                f"--display exploded supports only enabled and amount (the exploded layout "
-                f"is automatic); unsupported keys: {', '.join(unknown)} ({source_label})"
-            )
-def load_display_option(raw_display: object, *, cwd: Path) -> dict[str, object]:
+            raise SnapshotError(f"display.{name} has unknown key(s): {', '.join(unknown)}; supported keys: {', '.join(sorted(keys))}")
+        if "enabled" in value:
+            _render_boolean(value["enabled"], f"display.{name}.enabled")
+        if "color" in value:
+            _render_color(value["color"], f"display.{name}.color")
+        if "opacity" in value:
+            _render_number(value["opacity"], f"display.{name}.opacity", 0, 1)
+        for key, allowed in {
+            "camera": {"projection": frozenset({"orthographic", "perspective"})},
+            "surfaces": {"style": DISPLAY_SURFACE_STYLES, "colorMode": PART_COLOR_MODES},
+            "edges": {"visibility": frozenset({"visible", "all"})},
+            "lighting": {"quality": RENDER_QUALITY_IDS},
+            "floor": {"placement": frozenset({"origin", "lowest"}), "finish": DISPLAY_FLOOR_FINISHES},
+            "clip": {"axis": frozenset({"x", "y", "z"})},
+        }.get(name, {}).items():
+            if key in value:
+                _display_enum(value[key], f"display.{name}.{key}", allowed)
+        for key, bounds in {
+            "camera": {"focalLength": (20, 200)},
+            "lighting": {"exposure": (-5, 5), "rotation": (-180, 180), "size": (0.25, 3), "fill": (0, 1)},
+            "grid": {"density": (0.25, 4)},
+            "exploded": {"amount": (0, 1)}, "clip": {"offset": (0, 1)},
+        }.get(name, {}).items():
+            if key in value:
+                _render_number(value[key], f"display.{name}.{key}", *bounds)
+        if name == "surfaces" and "colors" in value:
+            colors = value["colors"]
+            if not isinstance(colors, list) or not 1 <= len(colors) <= 50:
+                raise SnapshotError("display.surfaces.colors must contain 1 to 50 hex colors")
+            for index, color in enumerate(colors):
+                _render_color(color, f"display.surfaces.colors[{index}]")
+        if name == "clip":
+            if "invert" in value:
+                _render_boolean(value["invert"], "display.clip.invert")
+            if "offsets" in value:
+                offsets = value["offsets"]
+                if not is_plain_object(offsets) or set(offsets) - {"x", "y", "z"}:
+                    raise SnapshotError("display.clip.offsets must be an object containing only x, y, z")
+                for axis, offset in offsets.items():
+                    _render_number(offset, f"display.clip.offsets.{axis}", 0, 1)
+
+
+# What belongs to a CAD model (STEP) alone. Edges are drawn from B-rep topology,
+# Explode separates an assembly's parts and Clip sections its solids; a mesh, a robot
+# description or a drawing has none of those. The shared viewer does not offer them
+# for such a file, and the presets built from edges with them.
+CAD_MODEL_DISPLAY_GROUPS = ("edges", "clip", "exploded")
+CAD_MODEL_DISPLAY_MODES = frozenset({"xray", "hidden-line", "wireframe"})
+# "hidden" and "off" let the edges carry the picture; without edges they draw nothing.
+CAD_MODEL_SURFACE_STYLES = frozenset({"hidden", "off"})
+CAD_MODEL_KINDS = frozenset({"step", "stp"})
+# Inputs that are DRAWN rather than staged. Nothing in `display` but
+# ``appearance`` reaches them, which is a stricter rule than the one below and is
+# stated where a drawing's rules live
+# (:func:`cadgen.snapshot_cli.check_drawing_render_job`).
+DRAWING_KINDS = frozenset({"dxf"})
+
+
+def validate_display_for_kind(display: Mapping[str, object], *, kind: str, input_label: str) -> None:
+    """Refuse STEP-only display settings for an input that is not a STEP model.
+
+    Asking for a section of a mesh would otherwise render a picture that silently
+    ignores the request, so the request is refused by name, as the viewer refuses
+    to offer the control.
+
+    A drawing is skipped, not exempt: its own check refuses the whole of
+    ``display`` but ``appearance``, and would otherwise be pre-empted here by a
+    message offering it the 'solid' and 'render' presets it cannot take either.
+    """
+    if kind in CAD_MODEL_KINDS or kind in DRAWING_KINDS or not is_plain_object(display):
+        return
+    requested = [f"display.{name}" for name in CAD_MODEL_DISPLAY_GROUPS if name in display]
+    mode = display.get("mode")
+    if isinstance(mode, str) and mode in CAD_MODEL_DISPLAY_MODES:
+        requested.append(f"display.mode {mode!r}")
+    surfaces = display.get("surfaces")
+    style = surfaces.get("style") if is_plain_object(surfaces) else None
+    if isinstance(style, str) and style in CAD_MODEL_SURFACE_STYLES:
+        requested.append(f"display.surfaces.style {style!r}")
+    if requested:
+        raise SnapshotError(
+            f"{', '.join(requested)} {'applies' if len(requested) == 1 else 'apply'} to STEP models only; "
+            f"{input_label} has no CAD edges, parts to explode or solids to section. "
+            "Remove the setting; the modes available here are 'solid' and 'render', "
+            "and the surface styles 'shaded' and 'flat'."
+        )
+
+
+class ValidatedDisplay(dict):
+    """A display object whose keys and values :func:`load_display_option` checked.
+
+    The type IS the record that the check ran. A display reaches a job from a
+    flag (loaded when the options become a job) or from the job file (loaded when
+    the job is prepared); whichever comes first validates it, and preparation
+    recognises the result instead of validating the same object again. It survives
+    ``copy.deepcopy``, which is how a job travels between those two steps.
+    """
+
+
+def _find_display_object(
+    raw_display: object,
+    *,
+    cwd: Path,
+    modes: frozenset[str] | None = None,
+) -> dict[str, object]:
+    """``--display`` (or a job's ``display``) as the display object it names.
+
+    A preset name, inline JSON, a path to a JSON file, or — from a verb call —
+    the object itself. ``modes`` is the preset vocabulary an unknown bare word is
+    told.
+
+    Underscore-prefixed keys are comments. JSON has none of its own, and an
+    authored settings file is exactly the kind of file that needs to explain why
+    its numbers are what they are.
+    """
     if is_plain_object(raw_display):
-        payload = validate_direct_settings_payload(
-            raw_display,
-            option_name="--display",
-            source_label="display settings",
-            allowed_keys=DISPLAY_OPTION_KEYS,
-            setting_label="display settings",
-        )
-        validate_display_settings_values(payload, source_label="display settings")
-        return payload
-    display = str(raw_display or "").strip()
-    if not display:
-        raise SnapshotError("--display requires a JSON object, JSON file path, or display mode")
-    if display.startswith("{"):
-        payload = validate_direct_settings_payload(
-            load_json_text(display, "--display"),
-            option_name="--display",
-            source_label="--display",
-            allowed_keys=DISPLAY_OPTION_KEYS,
-            setting_label="display settings",
-        )
-        validate_display_settings_values(payload, source_label="--display")
-        return payload
+        parsed: object = raw_display
+        source_label = "display settings"
+    else:
+        display = str(raw_display or "").strip()
+        if not display:
+            raise SnapshotError("--display requires a JSON object, JSON file path, or display mode")
+        # Preset names are unambiguous even when the working directory contains a
+        # folder with the same name (for example an output folder called render).
+        if display in DISPLAY_MODES:
+            return {"mode": display}
+        if display.startswith("{"):
+            parsed, source_label = load_json_text(display, "--display"), "--display"
+        else:
+            display_path = Path(display).expanduser()
+            if not display_path.is_absolute():
+                display_path = cwd / display_path
+            looks_like_file = display.lower().endswith(".json") or "/" in display or "\\" in display
+            if not looks_like_file and not display_path.exists():
+                if modes is not None and not modes:
+                    # An input with NO presets at all (a drawing): "supported
+                    # modes: " followed by nothing is not an answer.
+                    raise SnapshotError(
+                        f"Unsupported display mode: {display}. This input takes no display "
+                        'preset — its whole appearance is light or dark ("display": '
+                        '{"appearance": "dark"}).'
+                    )
+                supported = ", ".join(sorted(modes or DISPLAY_MODES))
+                raise SnapshotError(f"Unsupported display mode: {display}. Supported modes: {supported}")
+            if not display_path.exists():
+                raise SnapshotError(f"Display JSON file does not exist: {display}")
+            if display_path.is_dir():
+                raise SnapshotError(
+                    f"--display names a directory, not a display JSON file: {display}"
+                )
+            try:
+                text = display_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise SnapshotError(f"Cannot read display JSON file {display}: {exc}") from exc
+            parsed, source_label = load_json_text(text, str(display_path)), str(display_path)
+    if not is_plain_object(parsed):
+        raise SnapshotError(f"--display JSON must be a display settings object: {source_label}")
+    return {key: value for key, value in parsed.items() if not str(key).startswith("_")}
 
-    display_path = Path(display).expanduser()
-    if not display_path.is_absolute():
-        display_path = cwd / display_path
-    looks_like_file = display.lower().endswith(".json") or "/" in display or "\\" in display
-    if not looks_like_file and not display_path.exists():
-        normalized_mode = re.sub(r"[\s-]+", "_", display.lower())
-        if normalized_mode not in DISPLAY_MODE_ALIASES:
-            supported = ", ".join(sorted(set(DISPLAY_MODE_ALIASES.values())))
-            raise SnapshotError(f"Unsupported display mode: {display}. Supported modes: {supported}")
-        return {"mode": DISPLAY_MODE_ALIASES[normalized_mode]}
-    if not display_path.exists():
-        raise SnapshotError(f"Display JSON file does not exist: {display}")
-    payload = validate_direct_settings_payload(
-        load_json_text(display_path.read_text(encoding="utf-8"), str(display_path)),
-        option_name="--display",
-        source_label=str(display_path),
-        allowed_keys=DISPLAY_OPTION_KEYS,
-        setting_label="display settings",
-    )
-    validate_display_settings_values(payload, source_label=str(display_path))
-    return payload
-def load_theme_option(raw_theme: object, *, cwd: Path) -> object:
-    if is_plain_object(raw_theme):
-        return validate_direct_settings_payload(
-            raw_theme,
-            option_name="--theme",
-            source_label="theme settings",
-            allowed_keys=THEME_OPTION_KEYS,
-            setting_label="theme settings",
-        )
-    theme = str(raw_theme or DEFAULT_RENDER_THEME_ID).strip() or DEFAULT_RENDER_THEME_ID
-    if theme.startswith("{"):
-        return validate_direct_settings_payload(
-            load_json_text(theme, "--theme"),
-            option_name="--theme",
-            source_label="--theme",
-            allowed_keys=THEME_OPTION_KEYS,
-            setting_label="theme settings",
-        )
 
-    theme_path = Path(theme).expanduser()
-    if not theme_path.is_absolute():
-        theme_path = cwd / theme_path
-    looks_like_file = theme.lower().endswith(".json") or "/" in theme or "\\" in theme
-    if not looks_like_file and not theme_path.exists():
-        return theme
-    if not theme_path.exists():
-        raise SnapshotError(f"Theme JSON file does not exist: {theme}")
-    return validate_direct_settings_payload(
-        load_json_text(theme_path.read_text(encoding="utf-8"), str(theme_path)),
-        option_name="--theme",
-        source_label=str(theme_path),
-        allowed_keys=THEME_OPTION_KEYS,
-        setting_label="theme settings",
-    )
+def load_display_option(
+    raw_display: object,
+    *,
+    cwd: Path,
+    modes: frozenset[str] | None = None,
+) -> ValidatedDisplay:
+    """The validated display object for one job: found, then checked ONCE.
+
+    ``modes`` is the preset vocabulary errors list — the input kind's, when the
+    caller knows it (:func:`display_modes_for_kind`).
+    """
+    if isinstance(raw_display, ValidatedDisplay):
+        return raw_display
+    payload = _find_display_object(raw_display, cwd=cwd, modes=modes)
+    validate_display_settings_values(payload, source_label="display settings", modes=modes)
+    return ValidatedDisplay(payload)
+def _render_number(value: object, field: str, minimum: float, maximum: float) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not isfinite(float(value))
+        or float(value) < minimum
+        or float(value) > maximum
+    ):
+        raise SnapshotError(f"{field} must be a finite number between {minimum} and {maximum}")
+
+
+def _render_color(value: object, field: str) -> None:
+    if not isinstance(value, str) or not re.fullmatch(r"#(?:[0-9a-fA-F]{3}){1,2}", value.strip()):
+        raise SnapshotError(f"{field} must be a hex color")
+
+
+def _render_boolean(value: object, field: str) -> None:
+    if not isinstance(value, bool):
+        raise SnapshotError(f"{field} must be a boolean")
+
+
+def validate_output_settings(value: object) -> dict[str, object]:
+    if value is None:
+        return {}
+    if not is_plain_object(value):
+        raise SnapshotError("output must be an object")
+    output = dict(value)
+    unknown = sorted(set(output) - SUPPORTED_OUTPUT_SETTINGS_KEYS)
+    if unknown:
+        retired = [
+            f"output.{key} was removed; use output.{RETIRED_OUTPUT_SETTINGS_KEYS[key]}"
+            for key in unknown
+            if key in RETIRED_OUTPUT_SETTINGS_KEYS
+        ]
+        raise SnapshotError(
+            f"output has unknown key(s): {', '.join(unknown)}; "
+            f"supported keys: {', '.join(sorted(SUPPORTED_OUTPUT_SETTINGS_KEYS))}"
+            + (f"; {'; '.join(retired)}" if retired else "")
+        )
+    if "sizeProfile" in output:
+        output["sizeProfile"] = validate_size_profile(output["sizeProfile"])
+    if "padding" in output:
+        _render_number(output["padding"], "output.padding", *OUTPUT_PADDING_RANGE)
+    if "renderScale" in output:
+        _render_number(output["renderScale"], "output.renderScale", *OUTPUT_RENDER_SCALE_RANGE)
+    for key in ("viewLabels", "tightFrame", "transparent"):
+        if key in output:
+            _render_boolean(output[key], f"output.{key}")
+    return output
+
+
+def validate_size_profile(value: object) -> str:
+    """One of :data:`SIZE_PROFILES`, exactly as listed."""
+    if isinstance(value, str) and value in SIZE_PROFILES:
+        return value
+    if isinstance(value, str) and value in RETIRED_SIZE_PROFILES:
+        raise SnapshotError(
+            f"size profile {value!r} was removed; use {RETIRED_SIZE_PROFILES[value]!r}"
+        )
+    sizes = ", ".join(f"{name} ({width}x{height})" for name, (width, height) in SIZE_PROFILES.items())
+    raise SnapshotError(f"Unknown size profile: {value!r}. Size profiles: {sizes}")
+
+
+def validate_section(value: object) -> dict[str, object]:
+    """``{"plane": "XY"|"XZ"|"YZ", "offset": <number>}`` — where section mode cuts.
+
+    The plane is named by the two axes it contains; the offset moves it along its
+    own normal (Z for XY, Y for XZ, X for YZ) in model units, and defaults to 0.
+    These are exactly the two fields the renderer reads.
+    """
+    if not is_plain_object(value):
+        raise SnapshotError(
+            'section must be a {"plane": "XY"|"XZ"|"YZ", "offset": number} object, '
+            f"got {json.dumps(value)}"
+        )
+    unknown = sorted(set(value) - SECTION_KEYS)
+    if unknown:
+        raise SnapshotError(
+            f"section has unknown key(s): {', '.join(unknown)}; "
+            f"supported keys: {', '.join(sorted(SECTION_KEYS))}"
+        )
+    plane = value.get("plane", SECTION_PLANES[0])
+    if not isinstance(plane, str) or plane not in SECTION_PLANES:
+        raise SnapshotError(f"section.plane must be one of: {', '.join(SECTION_PLANES)}; got {plane!r}")
+    offset = value.get("offset", 0)
+    if isinstance(offset, bool) or not isinstance(offset, (int, float)) or not isfinite(float(offset)):
+        raise SnapshotError(f"section.offset must be a finite number in model units; got {offset!r}")
+    return {"plane": plane, "offset": offset}
+
+
+def parse_section_option(raw_section: object) -> dict[str, object]:
+    """``--section PLANE[:OFFSET]`` in job form.
+
+    Already an object when it came from a ``step.snapshot(section={...})`` call.
+    From argv it is one string shaped like ``--camera``'s angle pair: the plane,
+    then optionally a colon and the offset along its normal (``XZ:12.5``).
+    """
+    if is_plain_object(raw_section):
+        return validate_section(raw_section)
+    text = str(raw_section or "").strip()
+    if not text:
+        raise SnapshotError("--section requires PLANE[:OFFSET], for example XZ or XZ:12.5")
+    plane, separator, raw_offset = text.partition(":")
+    request: dict[str, object] = {"plane": plane.strip()}
+    if separator:
+        try:
+            request["offset"] = float(raw_offset)
+        except ValueError as exc:
+            raise SnapshotError(
+                f"--section offset must be a number in model units, got {raw_offset!r} (PLANE[:OFFSET])"
+            ) from exc
+    return validate_section(request)
+
+
+def normalize_render_mode(value: object) -> str:
+    """The job's ``mode``, lower-cased and checked — the ONE place its case is decided.
+
+    ``--mode LIST`` and a packet's ``"mode": "List"`` both mean ``list`` everywhere
+    downstream, including the rule that list mode needs no OUT.
+    """
+    mode = str(value or "view").strip().lower()
+    if mode not in SUPPORTED_RENDER_MODES:
+        raise SnapshotError(
+            f"Unsupported render mode: {mode or '(missing)'}. "
+            f"Modes: {', '.join(sorted(SUPPORTED_RENDER_MODES))}"
+        )
+    return mode
+
+
+def validate_timeout_seconds(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(float(value)) or value <= 0:
+        raise SnapshotError(f"timeoutSeconds must be a positive finite number of seconds; got {value!r}")
+    return float(value)
+
+
+def validate_quality_settings(value: object) -> dict[str, object]:
+    if value is None:
+        return {}
+    if not is_plain_object(value):
+        raise SnapshotError("quality must be an object")
+    quality = dict(value)
+    unknown = sorted(set(quality) - SUPPORTED_QUALITY_KEYS)
+    if unknown:
+        raise SnapshotError(
+            f"quality has unknown key(s): {', '.join(unknown)}; "
+            f"supported keys: {', '.join(sorted(SUPPORTED_QUALITY_KEYS))}"
+        )
+    validate_render_tessellation(quality.get("tessellation"))
+    return quality
+
+
 def path_is_inside_or_equal(child: Path, parent: Path) -> bool:
     resolved_child = child.resolve()
     resolved_parent = parent.resolve()
@@ -411,11 +830,9 @@ def asset_url_for_path(file_path: Path, root_path: Path) -> str:
     try:
         file_stat = resolved_path.stat()
     except FileNotFoundError:
-        # Same-stem generator inputs resolve to a STEP path that is never written
-        # (the generator runs with skip_step_write=True), so there is nothing to
-        # version; keep the unversioned URL for those. Any other stat failure is
-        # left to propagate: silently falling back to an unversioned URL would
-        # re-enable the very collision this key exists to prevent.
+        # Nothing to version. Any other stat failure is left to propagate:
+        # silently falling back to an unversioned URL would re-enable the very
+        # collision this key exists to prevent.
         return base_url
     cache_identity = "\0".join(
         (
@@ -426,50 +843,29 @@ def asset_url_for_path(file_path: Path, root_path: Path) -> str:
     )
     cache_key = sha256(cache_identity.encode("utf-8")).hexdigest()[:16]
     return f"{base_url}?v={cache_key}"
-def theme_id_for_job(job: Mapping[str, object]) -> str:
-    theme = job.get("theme")
-    if isinstance(theme, str):
-        return theme.strip().lower() or DEFAULT_RENDER_THEME_ID
-    return DEFAULT_RENDER_THEME_ID
-def normalize_size_profile(value: object) -> str:
-    return str(value or "").strip().lower().replace("_", "-")
-def explicit_size_profile(job: Mapping[str, object], output: Mapping[str, object]) -> str:
-    render = job.get("render") if is_plain_object(job.get("render")) else {}
-    return normalize_size_profile(output.get("sizeProfile") or render.get("sizeProfile") or job.get("sizeProfile") or "")
-def default_render_size(job: Mapping[str, object], output: Mapping[str, object]) -> tuple[int, int]:
-    mode = str(job.get("mode") or "view").strip().lower()
-    profile = explicit_size_profile(job, output)
-    if profile in {"simple-square", "square"}:
-        return SIMPLE_SQUARE_RENDER_WIDTH, SIMPLE_SQUARE_RENDER_HEIGHT
-    if profile in {"simple", "simple-part", "unlabeled"}:
-        return SIMPLE_RENDER_WIDTH, SIMPLE_RENDER_HEIGHT
-    if profile in {"presentation-large", "hero", "large-presentation"}:
-        return PRESENTATION_LARGE_RENDER_WIDTH, PRESENTATION_LARGE_RENDER_HEIGHT
-    if profile == "presentation":
-        return PRESENTATION_RENDER_WIDTH, PRESENTATION_RENDER_HEIGHT
-    if profile in {"complex-assembly-large", "assembly-large"}:
-        return COMPLEX_ASSEMBLY_LARGE_RENDER_WIDTH, COMPLEX_ASSEMBLY_LARGE_RENDER_HEIGHT
-    if profile in {"complex-assembly", "assembly"}:
-        return COMPLEX_ASSEMBLY_RENDER_WIDTH, COMPLEX_ASSEMBLY_RENDER_HEIGHT
-    if profile in {"contact-sheet", "contactsheet"}:
-        return CONTACT_SHEET_RENDER_WIDTH, CONTACT_SHEET_RENDER_HEIGHT
-    render = job.get("render") if is_plain_object(job.get("render")) else {}
-    if (
-        profile in {"dimensioned", "section", "labeled"}
-        or mode == "section"
-        or render.get("viewLabels") is True
-        or output.get("viewLabel")
-        or output.get("label")
-    ):
-        return DIAGNOSTIC_RENDER_WIDTH, DIAGNOSTIC_RENDER_HEIGHT
-    if profile == "diagnostic" or theme_id_for_job(job) in WORKBENCH_RENDER_THEME_IDS:
-        return DIAGNOSTIC_RENDER_WIDTH, DIAGNOSTIC_RENDER_HEIGHT
-    return SIMPLE_RENDER_WIDTH, SIMPLE_RENDER_HEIGHT
+def default_render_size(job: Mapping[str, object]) -> tuple[int, int]:
+    """The job's size profile, or :data:`DEFAULT_SIZE_PROFILE` when it names none."""
+    output_settings = job.get("output") if is_plain_object(job.get("output")) else {}
+    return SIZE_PROFILES[validate_size_profile(output_settings.get("sizeProfile", DEFAULT_SIZE_PROFILE))]
+
+
+def output_dimension(value: object, label: str) -> int:
+    """A requested output side: a whole number of pixels, 1..MAX_OUTPUT_DIMENSION."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise SnapshotError(f"{label} must be a positive whole number of pixels; got {value!r}")
+    if value > MAX_OUTPUT_DIMENSION:
+        raise SnapshotError(
+            f"{label} {value} exceeds the maximum of {MAX_OUTPUT_DIMENSION} px; past that the "
+            "renderer's drawing buffer is clamped and the image would not be the size requested"
+        )
+    return value
+
+
 def resolve_output_size(job: Mapping[str, object], output: Mapping[str, object]) -> tuple[int, int]:
-    default_width, default_height = default_render_size(job, output)
+    default_width, default_height = default_render_size(job)
     return (
-        positive_integer(output.get("width") or job.get("width") or default_width, "output width"),
-        positive_integer(output.get("height") or job.get("height") or default_height, "output height"),
+        output_dimension(output["width"], "output width") if output.get("width") is not None else default_width,
+        output_dimension(output["height"], "output height") if output.get("height") is not None else default_height,
     )
 def snapshot_timestamp() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -596,11 +992,16 @@ def clear_render_output_targets(jobs: object, *, resolved_cwd: Path | None = Non
     it is why a declared path can now be honoured exactly: whatever happens next,
     the only thing that can appear at that path is this run's output.
 
-    "Before any work" is stronger than "before the browser starts", and the
-    difference is the common failure. Resolution builds the STEP package, and that
-    is where a bad input fails -- minutes in, and long before the renderer is
-    reached. Clearing at render time would leave the previous image sitting at the
-    requested path for exactly the runs most likely to be read anyway.
+    It runs AFTER the request is prepared and BEFORE it is resolved. A request
+    that is refused -- an unknown key, a setting this kind of input cannot take,
+    a conflict between options -- was never going to write anything, so it leaves
+    an existing file alone; every such refusal is decided in preparation, which
+    builds nothing. "Before any work" is still stronger than "before the browser
+    starts", and the difference is the common failure: resolution builds the STEP
+    package, and that is where a bad INPUT fails -- minutes in, and long before
+    the renderer is reached. Clearing at render time would leave the previous
+    image sitting at the requested path for exactly the runs most likely to be
+    read anyway.
 
     Directory-valued outputs are skipped: their name is generated fresh, so there
     is nothing of theirs to delete, and unlinking the directory itself would be
@@ -630,6 +1031,34 @@ def normalize_snapshot_job_packet(raw_payload: object) -> tuple[bool, list[objec
     if is_plain_object(raw_payload) and isinstance(raw_payload.get("jobs"), list):
         return False, list(raw_payload["jobs"])
     return True, [raw_payload]
+def validate_render_tessellation(value: object) -> None:
+    """Refuse an unusable ``quality.tessellation`` here, where the caller still
+    gets a message. The page validates the same field (source.js) because it
+    also serves the viewer, but by then the cost of an absurd request is a dead
+    renderer and no explanation."""
+    if value is None:
+        return
+    if not is_plain_object(value):
+        raise SnapshotError("quality.tessellation must be an object of chordTolerance/angleTolerance")
+    unknown = sorted(set(value) - set(MIN_RENDER_TESSELLATION))
+    if unknown:
+        raise SnapshotError(
+            f"quality.tessellation has unknown key(s): {', '.join(unknown)}; "
+            f"supported keys: {', '.join(sorted(MIN_RENDER_TESSELLATION))}"
+        )
+    for key, floor in MIN_RENDER_TESSELLATION.items():
+        if key not in value:
+            continue
+        raw = value[key]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not isfinite(float(raw)) or float(raw) <= 0:
+            raise SnapshotError(f"quality.tessellation.{key} must be a positive finite number")
+        if float(raw) < floor:
+            raise SnapshotError(
+                f"quality.tessellation.{key} must be at least {floor}; finer sampling "
+                "exhausts the renderer instead of improving the image"
+            )
+
+
 def normalize_common_job(
     job: dict[str, object],
     *,
@@ -640,11 +1069,13 @@ def normalize_common_job(
     job_count: int = 1,
 ) -> dict[str, object]:
     """Kind-independent job normalization shared by every input kind: the outputs
-    guard, render scene-scale coercion, output-path resolution with per-output
-    camera defaults, and the common return shape.
-    Kind resolvers run their capability checks first, then call this, so a
-    STEP/mesh/robot job all normalize identically; the caller attaches its
-    kind-specific ``resolved`` payload to the returned job.
+    guard, output/quality/section validation, output-path resolution, and the
+    common return shape.
+    Job preparation runs the kind's capability checks first, then calls this, so a
+    STEP/mesh/robot job all normalize identically; the kind resolver attaches its
+    ``resolved`` payload to the returned job. ``display`` arrives already validated
+    (:func:`load_display_option` — once per job, where the input's kind is known);
+    this only fills its two defaults.
 
     ``job_index``/``job_count`` are this job's place in its packet, needed only
     so a directory-valued output's generated name can discriminate across jobs
@@ -653,41 +1084,59 @@ def normalize_common_job(
     if mode != "list" and not outputs:
         raise SnapshotError("render job must include outputs for non-list modes")
 
-    # GIF export is deleted: snapshot writes PNG stills only. Refuse the
-    # output up front so an old recipe fails loudly instead of rendering a
-    # still into a .gif name.
-    for output in outputs:
-        output_path_text = str((output.get("path") if is_plain_object(output) else output) or "")
-        if output_path_text.strip().lower().endswith(".gif"):
+    # What an output may be named follows from whether this job asked for a
+    # sequence. A still writes PNG, so a VIDEO name is refused up front: writing
+    # a PNG into one answers a motion question with a frozen image under a name
+    # no player opens, at exit 0. A video writes exactly one file, and its
+    # extension picks the container. Both halves read the same table, so the
+    # names a video may be given and the names a still may not cannot drift.
+    video = job.get("video")
+    if video is not None:
+        from cadgen.snapshot_video import validate_video_output
+
+        if len(outputs) != 1:
             raise SnapshotError(
-                "snapshot renders PNG stills: name a .png output "
-                "(motion review lives in the CAD Viewer)"
+                f"a video renders one clip to one file; this job declares {len(outputs)} "
+                "outputs (split the cameras into their own jobs)"
             )
+        # `video` is the NORMALIZED request by the time it gets here (the kind
+        # resolver validated its shape), so only the output half is left.
+        validate_video_output(video, declared_output_path(outputs[0]))
+    else:
+        from cadgen.snapshot_video import VIDEO_CONTAINERS
 
-    # A job's own `theme` string gets the SAME treatment as the
-    # `--theme` flag: a saved-theme name stays a name, but a path or an
-    # inline JSON object is loaded into real settings here.
-    #
-    # Without this a job saying `"theme": "path/to/theme.json"` fell all
-    # the way through to `theme_id_for_job()`, which lowercases the
-    # string and treats it as a saved-theme id. The lookup missed, the renderer
-    # silently used the default workbench theme, and — because the resolved id
-    # was then `workbench` — the size-profile logic further down also quietly
-    # switched to diagnostic dimensions. Exit 0, no warning, a plausible but
-    # wrong image. The CLI help has always promised that a file path works.
-    raw_theme = job.get("theme")
-    if isinstance(raw_theme, str) and raw_theme.strip():
-        job["theme"] = load_theme_option(raw_theme, cwd=resolved_cwd)
+        for output in outputs:
+            output_path_text = str((output.get("path") if is_plain_object(output) else output) or "")
+            if Path(output_path_text.strip()).suffix.lower() in VIDEO_CONTAINERS:
+                raise SnapshotError(
+                    f"snapshot renders PNG stills: {output_path_text.strip()} names a video "
+                    "container, so name a .png output, or pass --video with --animation to "
+                    "render the clip into it"
+                )
 
-    normalized_render = dict(job.get("render") if is_plain_object(job.get("render")) else {})
-    raw_scale = str(
-        normalized_render.get("scale")
-        or normalized_render.get("sceneScale")
-        or normalized_render.get("sceneScaleMode")
-        or job.get("scale")
-        or job.get("sceneScale")
-        or ""
-    ).strip().lower()
+    output_settings = validate_output_settings(job.get("output"))
+    quality = validate_quality_settings(job.get("quality"))
+    if not is_plain_object(job.get("display", {})):
+        raise SnapshotError("display must be a display settings object")
+    # Every mode shares its preset defaults with the Viewer; only appearance is
+    # fixed to Light for deterministic CLI output.
+    display = {"mode": "solid", "appearance": "light", **job.get("display", {})}
+
+    # Where section mode cuts. The key means nothing to a view or a list, and a
+    # request that carries it there expected a cut it would not get.
+    if mode == "section":
+        job["section"] = validate_section(job.get("section", {}))
+    elif "section" in job:
+        raise SnapshotError(
+            f"section positions the cut of section mode, and this job's mode is {mode}; "
+            'set "mode": "section" (--mode section), or clip a view with display.clip'
+        )
+    if "timeoutSeconds" in job:
+        job["timeoutSeconds"] = validate_timeout_seconds(job["timeoutSeconds"])
+    if "debug" in job:
+        _render_boolean(job["debug"], "debug")
+
+    raw_scale = str(job.get("scale") or "").strip().lower()
     if raw_scale:
         # Honour the requested scale. This used to force "cad" unconditionally, so a job
         # asking for the URDF profile (robots are authored in metres, CAD in millimetres)
@@ -695,7 +1144,7 @@ def normalize_common_job(
         # correctly but framed for a workpiece a thousand times its size.
         if raw_scale not in {"cad", "urdf"}:
             raise SnapshotError(f"Unsupported scene scale: {raw_scale} (expected cad or urdf)")
-        normalized_render["scale"] = raw_scale
+        job["scale"] = raw_scale
 
     normalized_outputs: list[dict[str, object]] = []
     resolved_timestamp = timestamp or snapshot_timestamp()
@@ -712,6 +1161,13 @@ def normalize_common_job(
         # silently, so the render completed with nothing hidden/focused.
         unknown_output_keys = sorted(set(output_object) - SUPPORTED_OUTPUT_KEYS)
         if unknown_output_keys:
+            result_keys = [key for key in unknown_output_keys if key in RESULT_ONLY_OUTPUT_KEYS]
+            if result_keys:
+                raise SnapshotError(
+                    f"render output {index} carries {', '.join(result_keys)}: those are what the "
+                    "renderer reports about a finished output, not something a request sets — "
+                    f"supported output keys: {', '.join(sorted(SUPPORTED_OUTPUT_KEYS))}"
+                )
             if "selection" in unknown_output_keys:
                 raise SnapshotError(
                     f"render output {index} carries a selection; selection applies at job "
@@ -731,8 +1187,7 @@ def normalize_common_job(
                 f"render output {index} has no path; each output must be a path "
                 'string or an object with a "path"'
             )
-        normalized_outputs.append(
-            {
+        normalized_output = {
                 **output_object,
                 "path": resolve_output_target(
                     output_path,
@@ -748,15 +1203,32 @@ def normalize_common_job(
                 ),
                 "width": width,
                 "height": height,
-                "camera": output_object.get("camera") or job.get("camera") or "iso",
             }
-        )
+        if video is None and mode in STILL_OUTPUT_SUFFIXES:
+            # The extension decides the encoding, so one the mode cannot write is
+            # refused: a view wrote PNG bytes under whatever name it was handed,
+            # and a `.svg` or `.jpg` that is really a PNG opens nowhere.
+            suffix = Path(str(normalized_output["path"])).suffix.lower()
+            allowed = STILL_OUTPUT_SUFFIXES[mode]
+            if suffix not in allowed:
+                raise SnapshotError(
+                    f"{mode} mode writes {' or '.join(allowed)}: render output {index} names "
+                    f"{output_path.strip()!r}"
+                    + ("; a section can also be written as .svg with --mode section" if mode == "view" and suffix == ".svg" else "")
+                )
+        explicit_camera = output_object.get("camera")
+        if explicit_camera is None:
+            explicit_camera = job.get("camera")
+        if explicit_camera is not None:
+            normalized_output["camera"] = parse_camera_option(explicit_camera)
+        normalized_outputs.append(normalized_output)
 
     return {
         **job,
         "mode": mode,
-        "display": job.get("display") if is_plain_object(job.get("display")) else {"mode": "solid"},
-        "render": normalized_render,
+        "output": output_settings,
+        "quality": quality,
+        "display": display,
         "outputs": normalized_outputs,
     }
 def has_kinematics_render_values(value: object) -> bool:
@@ -771,89 +1243,110 @@ def selection_value_list(value: object) -> list[str]:
     if not text:
         return []
     return [entry.strip() for entry in text.split(",") if entry.strip()]
+SELECTION_KEYS = ("focus", "hide")
+RETIRED_SELECTION_KEYS = {"refs": "focus"}
+
+
+def validate_selection_keys(job: Mapping[str, object]) -> None:
+    """``selection`` is ``{"focus": [...]}`` or ``{"hide": [...]}`` and nothing else."""
+    if "selection" not in job or job["selection"] is None:
+        return
+    selection = job["selection"]
+    if not is_plain_object(selection):
+        raise SnapshotError('selection must be a {"focus": [refs]} or {"hide": [refs]} object')
+    unknown = sorted(set(selection) - set(SELECTION_KEYS))
+    if unknown:
+        retired = [
+            f"selection.{key} was removed; use selection.{RETIRED_SELECTION_KEYS[key]}"
+            for key in unknown
+            if key in RETIRED_SELECTION_KEYS
+        ]
+        raise SnapshotError(
+            f"selection has unknown key(s): {', '.join(unknown)}; "
+            f"supported keys: {', '.join(SELECTION_KEYS)}"
+            + (f"; {'; '.join(retired)}" if retired else "")
+        )
+
+
 def selection_filter_values(job: Mapping[str, object]) -> list[str]:
     selection = job.get("selection") if is_plain_object(job.get("selection")) else {}
     values: list[str] = []
-    for key in ("focus", "refs", "hide"):
+    for key in SELECTION_KEYS:
         values.extend(selection_value_list(selection.get(key)))
     return values
 
-def positive_integer(value: object, label: str) -> int:
-    try:
-        parsed = int(str(value or ""), 10)
-    except ValueError as exc:
-        raise SnapshotError(f"{label} must be a positive integer") from exc
-    if parsed <= 0:
-        raise SnapshotError(f"{label} must be a positive integer")
-    return parsed
+def refuse_cad_model_requests(
+    job: Mapping[str, object],
+    *,
+    mode: str,
+    subject: str,
+    pose_hint: str,
+    tessellation_hint: str,
+    joints: bool = False,
+) -> None:
+    """Refuse, by name, everything in ``job`` that only a STEP model can honour.
+
+    One rule for every input that is not a STEP model — a mesh, a drawing, a robot
+    description — so the three cannot drift: a request they cannot honour is
+    refused rather than rendered as though it had not been made. ``subject`` is
+    the plural the message talks about ("STL mesh inputs"); ``joints`` says whether
+    the input is a robot, the one thing ``jointValues`` poses.
+    """
+    if selection_filter_values(job):
+        raise SnapshotError(
+            f"selection focus/hide require STEP topology; {subject} have no "
+            "part/subassembly selectors"
+        )
+    if has_kinematics_render_values(job.get("kinematics")):
+        raise SnapshotError(f"kinematics values require a STEP model; {pose_hint}")
+    if job.get("jointValues") is not None and not joints:
+        raise SnapshotError(
+            "jointValues pose a robot description (URDF, SRDF or SDF); "
+            f"{subject} have no joints"
+        )
+    if job.get("animation") is not None:
+        raise SnapshotError(
+            "an animation frame requires a STEP document with animation in its sidecar; "
+            f"{subject} have no clips"
+        )
+    if job.get("video") is not None:
+        raise SnapshotError(f"a video renders an animation clip; {subject} have no clips to render")
+    quality = job.get("quality") if is_plain_object(job.get("quality")) else {}
+    if quality.get("tessellation") is not None:
+        raise SnapshotError(
+            f"quality.tessellation requires an exact-surface STEP package; {tessellation_hint}"
+        )
+    if mode not in MESH_SUPPORTED_RENDER_MODES or job.get("section") is not None:
+        supported = ", ".join(sorted(MESH_SUPPORTED_RENDER_MODES))
+        raise SnapshotError(f"section mode requires STEP topology; {subject} support: {supported}")
+
+
+def check_mesh_render_job(job: Mapping[str, object], *, kind: str, mode: str, **_context: object) -> None:
+    """What a direct mesh input (GLB/STL/3MF) cannot be asked for."""
+    label = kind.upper()
+    refuse_cad_model_requests(
+        job,
+        mode=mode,
+        subject=f"{label} mesh inputs",
+        pose_hint=f"{label} mesh inputs are not parametric",
+        tessellation_hint=f"{label} is an existing mesh",
+    )
+
+
 def resolve_mesh_render_job(
     job: dict[str, object],
     *,
     kind: str,
     input_path: Path,
     root_path: Path,
-    resolved_cwd: Path,
-    timestamp: str | None,
-    job_index: int = 0,
-    job_count: int = 1,
     **_kind_context: object,
 ) -> dict[str, object]:
     """Resolve a direct mesh input (GLB/STL/3MF) that carries no STEP topology.
 
     Meshes render through the shared mesh path, so this skips the STEP artifact/package
-    pipeline entirely and hands the renderer a plain asset URL. STEP-only options are
-    rejected up front with clear errors rather than silently ignored downstream."""
-    label = kind.upper()
-
-    # Selector focus/hide/refs need the selector index built from STEP topology.
-    if selection_filter_values(job):
-        raise SnapshotError(
-            f"selection focus/hide/refs require STEP topology; {label} mesh inputs have no "
-            "part/subassembly selectors"
-        )
-    # kinematics values drive the model's declared kinematics block.
-    if has_kinematics_render_values(job.get("kinematics")):
-        raise SnapshotError(
-            f"kinematics values require a STEP model; {label} mesh inputs are not parametric"
-        )
-    if job.get("animation") is not None:
-        raise SnapshotError(
-            f"an animation frame requires a STEP document with a render module beside it; "
-            f"{label} mesh inputs have no clips"
-        )
-
-    mode = str(job.get("mode") or "view").strip().lower()
-    if mode not in SUPPORTED_RENDER_MODES:
-        raise SnapshotError(f"Unsupported render mode: {mode or '(missing)'}")
-    if mode not in MESH_SUPPORTED_RENDER_MODES:
-        supported = ", ".join(sorted(MESH_SUPPORTED_RENDER_MODES))
-        raise SnapshotError(
-            f"{mode} mode requires STEP topology; {label} mesh inputs support: {supported}"
-        )
-
-    # Meshes render shaded solid (no CAD topology for edges/materials). Projection is
-    # honored by the renderer, but any non-solid display mode would be silently dropped,
-    # so reject it up front with a clear error instead of returning a misleading image.
-    display = job.get("display") if is_plain_object(job.get("display")) else {}
-    raw_display_mode = re.sub(r"[\s-]+", "_", str(display.get("mode") or "").strip().lower())
-    canonical_display_mode = DISPLAY_MODE_ALIASES.get(raw_display_mode, raw_display_mode)
-    if canonical_display_mode in TOPOLOGY_DISPLAY_MODES:
-        raise SnapshotError(
-            f"{canonical_display_mode} display requires STEP CAD edges; {label} mesh inputs "
-            "render shaded without CAD linework"
-        )
-    if canonical_display_mode and canonical_display_mode != "solid":
-        raise SnapshotError(
-            f"{canonical_display_mode} display mode is not supported for {label} mesh inputs; "
-            "meshes render shaded solid (STEP models support the full display-mode set)"
-        )
-    exploded = display.get("exploded") if is_plain_object(display.get("exploded")) else None
-    if exploded is not None and exploded.get("enabled"):
-        raise SnapshotError(
-            f"exploded view requires STEP assembly occurrence structure; {label} mesh inputs "
-            "cannot be exploded"
-        )
-
+    pipeline entirely and hands the renderer a plain asset URL. ``job`` is the
+    prepared job: what a mesh cannot be asked for was refused by
+    :func:`check_mesh_render_job` before anything was cleared or built."""
     asset_url = asset_url_for_path(input_path, root_path)
     resolved: dict[str, object] = {
         "rootPath": str(root_path),
@@ -864,17 +1357,7 @@ def resolve_mesh_render_job(
     }
     if bool(job.get("debug")):
         resolved["debug"] = {"meshSource": {"kind": kind}}
-
-    normalized = normalize_common_job(
-        job,
-        mode=mode,
-        resolved_cwd=resolved_cwd,
-        timestamp=timestamp,
-        job_index=job_index,
-        job_count=job_count,
-    )
-    normalized["resolved"] = resolved
-    return normalized
+    return {**job, "resolved": resolved}
 def content_type_for_path(path: Path) -> str:
     if path.suffix.lower() == ".mjs":
         return "text/javascript; charset=utf-8"
@@ -898,95 +1381,98 @@ def route_file(pathname: str, prefix: str, root: Path) -> Path:
     if not path_is_inside_or_equal(file_path, root):
         raise RouteFileError(f"forbidden route path: {pathname}", status=403)
     return file_path
-# --- shared component-tessellation cache (design/unified-tessellation.md) ----
+# --- shared component-tessellation cache -------------------------------------------
 #
 # The snapshot page resolves component tessellations through the SAME disk
-# cache the mesh-export CLI uses (~/.cache/cadgen/meshes/<key>.tess; codec and
-# key scheme in packages/cadgen-js/src/lib/surf/tessellationCache.js). The page
+# cache the mesh-export CLI uses (immutable objects plus index/mesh; codec and
+# key scheme in packages/core/src/lib/surf/tessellationCache.js). The page
 # cannot touch the filesystem, so the host serves the cache: GET
 # /__tess_cache/<key>.tess is a read, POST is a best-effort write-back after
 # an in-page tessellation miss. CADGEN_MESH_CACHE=0 turns both directions
-# off. Entries are opaque bytes here: Python never decodes them, it only
-# stores and serves what the one JS codec produced.
+# off. Python validates the shared TESS input identity, header and content hash;
+# metadata probes and exact-object reads enforce admission before body transfer.
 #
-# TRANSPORT: bulk bytes must NOT go through Playwright's route.fulfill. CDP
-# serializes every fulfilled body as base64 over the devtools pipe at
-# ~20 MB/s, which made a warm moonwatch snapshot spend ~8s moving ~180 MB of
-# surfs + cache entries. So the renderer runs a loopback HTTP server and the
-# intercepted snapshot.local routes for /__render_asset/ and /__tess_cache/
-# answer with a 307 to it — the tiny redirect crosses CDP, the payload rides
-# Chromium's native network stack. The page's origin stays snapshot.local, so
-# the loopback responses carry CORS headers for that origin (and answer the
-# preflight the redirected POST triggers).
+# TRANSPORT: bulk bytes must NOT go through Playwright at all. CDP serializes
+# every fulfilled body as base64 over the devtools pipe at ~20 MB/s, which made
+# a warm moonwatch snapshot spend ~8s moving ~180 MB of surfs + cache entries.
+# Worse, INTERCEPTION alone costs the pipe in the other direction: a routed
+# request's body reaches the driver as escaped text in one protocol message, so
+# a 92 MB cache write-back exceeded Node's string limit and killed the renderer
+# (reported to the caller as a lost driver connection). A 307 to loopback
+# cannot save such a request — by then the body has already crossed.
+#
+# So the renderer runs a loopback HTTP server and the page addresses it by its
+# ABSOLUTE origin for the cache (window.__cadgenSnapshotAssetOrigin, injected
+# in BatchSnapshotRenderer.start): those requests are never intercepted, in
+# either direction, at any size. Page-relative asset URLs (/__render_asset/,
+# the store prefix) are GET-only, so they stay intercepted and answer with a
+# tiny 307 to the same server. The intercepted page uses localhost (a secure
+# context for its required SubtleCrypto checks), while the loopback responses
+# carry CORS headers and answer the preflight their distinct origin triggers.
+# Without that server there is no working transport, so start() raises instead
+# of degrading.
 
 TESS_CACHE_ROUTE_PREFIX = "/__tess_cache/"
-# <cid>-t<tessellator-version>-l<chord>-a<angle>.tess with exponential-notation
-# tolerances (the key scheme's home is tessellationCache.js); anything else
-# (path separators, dots-runs, empty) is refused before touching disk.
+# The route's safe filename envelope. The store additionally requires the
+# current exact surface-input/algorithm/payload/binary64-tolerance key.
 TESS_CACHE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]*\.tess$")
 
 
-def tessellation_cache_enabled() -> bool:
-    return os.environ.get("CADGEN_MESH_CACHE") != "0"
+def _tessellation_cache_key(pathname: str) -> str | None:
+    name = str(pathname or "")[len(TESS_CACHE_ROUTE_PREFIX):]
+    if not TESS_CACHE_NAME_PATTERN.fullmatch(name) or ".." in name:
+        return None
+    return name[:-len(".tess")]
 
 
-def read_tessellation_cache_entry(pathname: str) -> bytes | None:
+def read_tessellation_cache_entry(pathname: str, *, expected_object=None, max_bytes=None) -> bytes | None:
     """One entry's bytes, from the mesh index (``index/mesh`` -> object); None
     for a refused name, a miss, or a disabled cache."""
-    from cadgen.viewer.tess_cache import read_tess_cache_entry
-
-    if not tessellation_cache_enabled():
+    from cadgen.store.tess_cache import read_tessellation_cache
+    key = _tessellation_cache_key(pathname)
+    if key is None:
         return None
-    status, data = read_tess_cache_entry(pathname)
-    return data if status == 200 else None
+    try:
+        # A disabled cache (CADGEN_MESH_CACHE=0) answers None from the store itself.
+        return read_tessellation_cache(
+            key, expected_object=expected_object, max_bytes=max_bytes,
+        )
+    except ValueError:
+        return None
 
 
 def write_tessellation_cache_entry(pathname: str, body: bytes | None) -> bool:
-    """Best-effort write-back; False only for an invalid name (a 403)."""
-    from cadgen.viewer.tess_cache import write_tess_cache_entry
-
-    return write_tess_cache_entry(pathname, body) != 403
+    """Best-effort write-back; False for an invalid or conflicting entry."""
+    return _write_tessellation_cache_entry_status(pathname, body) == 204
 
 
-# POST /__tess_cache/batch: one round trip for N entries — a many-component
-# assembly otherwise pays ~2 requests per component. Request body is JSON
-# {"names": ["<key>.tess", ...]}; the response is the TESB container defined
-# in packages/cadgen-js/src/lib/surf/tessellationCache.js (that file is the
-# format's single home; Python only frames the opaque entry bytes): "TESB"
-# u32, version u32, count u32, then per entry u32 byteLength (0 = miss) +
-# bytes padded to a 4-byte boundary.
+def _write_tessellation_cache_entry_status(pathname: str, body: bytes | None) -> int:
+    key = _tessellation_cache_key(pathname)
+    if key is None:
+        return 403
+    if body:
+        from cadgen.store.meshes import MeshConflictError
+        from cadgen.store.tess_cache import write_tessellation_cache
+        try:
+            write_tessellation_cache(key, body)
+        except MeshConflictError:
+            return 409
+        except (ValueError, TypeError, KeyError, OverflowError, struct.error):
+            return 400
+    return 204
+
+
+# Probe small index facts, then request only admitted exact objects. The shared
+# TESB container stays unchanged; store.tess_cache owns both hosts' framing.
 TESS_CACHE_BATCH_PATH = "/__tess_cache/batch"
-TESS_CACHE_BATCH_MAGIC = 0x42534554  # "TESB" little-endian
-TESS_CACHE_BATCH_VERSION = 1
-TESS_CACHE_BATCH_MAX_NAMES = 4096
+TESS_CACHE_PROBE_PATH = "/__tess_cache/probe"
 
 
 def read_tessellation_cache_batch(body: bytes | None) -> bytes | None:
-    """The TESB response for a batch request body, or None for a malformed
-    request (the route answers 400). Invalid names and read failures are
-    per-entry MISSES, never errors — the page's fallback is per-key gets."""
-    try:
-        names = json.loads((body or b"").decode("utf-8")).get("names")
-    except (ValueError, UnicodeDecodeError, AttributeError):
-        return None
-    if not isinstance(names, list) or len(names) > TESS_CACHE_BATCH_MAX_NAMES:
-        return None
-    entries: list[bytes] = []
-    for name in names:
-        entry = b""
-        if isinstance(name, str):
-            data = read_tessellation_cache_entry(f"{TESS_CACHE_ROUTE_PREFIX}{name}")
-            if data is not None:
-                entry = data
-        entries.append(entry)
-    parts = [struct.pack("<III", TESS_CACHE_BATCH_MAGIC, TESS_CACHE_BATCH_VERSION, len(entries))]
-    for entry in entries:
-        parts.append(struct.pack("<I", len(entry)))
-        parts.append(entry)
-        padding = (-len(entry)) % 4
-        if padding:
-            parts.append(b"\x00" * padding)
-    return b"".join(parts)
+    """One shared bounded exact-object TESB route for viewer and snapshots."""
+    from cadgen.store.tess_cache import read_tess_cache_batch
+
+    return read_tess_cache_batch(body)
 
 
 RENDER_ASSET_ROUTE_PREFIX = "/__render_asset/"
@@ -999,19 +1485,29 @@ def _store_packages_root() -> Path:
     return views_root()
 
 
+def _write_http_body(output, body: bytes) -> None:
+    """Send large mesh batches without exceeding a platform socket-write limit."""
+    view = memoryview(body)
+    for start in range(0, len(view), 16 * 1024 * 1024):
+        output.write(view[start : start + 16 * 1024 * 1024])
+
+
 class SnapshotAssetServer:
     """Loopback HTTP server for the snapshot page's BULK bytes.
 
     Serves exactly two path families — ``/__render_asset/`` (files under the
-    active render root, same containment rule as the CDP route) and
-    ``/__tess_cache/`` (the shared tessellation cache) — to whatever origin
-    the snapshot page runs as (CORS ``*``; the socket is loopback-only and
-    carries the same files the CDP route already served). ``root_provider``
-    is read per request so one server follows the renderer across jobs.
+    active render root, same containment rule as the CDP route for the page
+    itself) and ``/__tess_cache/`` (the shared tessellation cache) — to
+    whatever origin the snapshot page runs as (CORS ``*``; the socket is
+    loopback-only and serves only what the page may already read).
+    ``root_provider`` is read per request so one server follows the renderer
+    across jobs. There is no fallback: the renderer refuses to start without
+    this server, because the CDP transport cannot carry these payloads.
     """
 
     def __init__(self, root_provider) -> None:
         import http.server
+        import socketserver
 
         server = self
 
@@ -1024,6 +1520,7 @@ class SnapshotAssetServer:
             def _headers(self, status: int, content_type: str, length: int) -> None:
                 self.send_response(status)
                 self.send_header("access-control-allow-origin", "*")
+                self.send_header("access-control-expose-headers", "content-length")
                 self.send_header("cache-control", "no-store")
                 self.send_header("content-type", content_type)
                 self.send_header("content-length", str(length))
@@ -1032,7 +1529,7 @@ class SnapshotAssetServer:
             def _send(self, status: int, body: bytes = b"", content_type: str = "application/octet-stream") -> None:
                 self._headers(status, content_type, len(body))
                 if body:
-                    self.wfile.write(body)
+                    _write_http_body(self.wfile, body)
 
             def do_OPTIONS(self) -> None:  # noqa: N802 - http.server naming
                 self.send_response(204)
@@ -1043,9 +1540,22 @@ class SnapshotAssetServer:
                 self.end_headers()
 
             def do_GET(self) -> None:  # noqa: N802 - http.server naming
-                pathname = urlparse(self.path).path
+                parsed = urlparse(self.path)
+                pathname = parsed.path
                 if pathname.startswith(TESS_CACHE_ROUTE_PREFIX):
-                    body = read_tessellation_cache_entry(pathname)
+                    query = parse_qs(parsed.query)
+                    from cadgen.store.tess_cache import parse_tess_cache_admission
+
+                    try:
+                        digest, limit = parse_tess_cache_admission(
+                            query.get("object", [None])[0], query.get("maxBytes", [None])[0],
+                        )
+                    except (TypeError, ValueError):
+                        self._send(400)
+                        return
+                    body = read_tessellation_cache_entry(
+                        pathname, expected_object=digest, max_bytes=limit,
+                    )
                     if body is None:
                         self._send(404, b"miss", "text/plain; charset=utf-8")
                         return
@@ -1084,8 +1594,31 @@ class SnapshotAssetServer:
                 if not pathname.startswith(TESS_CACHE_ROUTE_PREFIX):
                     self._send(404, b"not found", "text/plain; charset=utf-8")
                     return
-                length = int(self.headers.get("content-length") or 0)
+                from cadgen.store.tess_cache import TESS_CACHE_METADATA_MAX_BYTES
+
+                try:
+                    length = int(self.headers.get("content-length") or 0)
+                    if length < 0 or self.headers.get("transfer-encoding"):
+                        raise ValueError("unsupported request framing")
+                except ValueError:
+                    self.close_connection = True
+                    self._send(400)
+                    return
+                maximum = TESS_CACHE_METADATA_MAX_BYTES if pathname in (TESS_CACHE_PROBE_PATH, TESS_CACHE_BATCH_PATH) else 256 * 1024 * 1024
+                if length > maximum:
+                    self.close_connection = True
+                    self._send(413, b"oversized cache request")
+                    return
                 body = self.rfile.read(length) if length > 0 else b""
+                if pathname == TESS_CACHE_PROBE_PATH:
+                    from cadgen.store.tess_cache import read_tess_cache_probe
+
+                    result = read_tess_cache_probe(body)
+                    if result is None:
+                        self._send(400, b"bad tessellation probe request")
+                        return
+                    self._send(200, json.dumps(result, separators=(",", ":")).encode(), "application/json")
+                    return
                 if pathname == TESS_CACHE_BATCH_PATH:
                     batch = read_tessellation_cache_batch(body)
                     if batch is None:
@@ -1093,11 +1626,17 @@ class SnapshotAssetServer:
                         return
                     self._send(200, batch)
                     return
-                accepted = write_tessellation_cache_entry(pathname, body)
-                self._send(204 if accepted else 403)
+                self._send(_write_tessellation_cache_entry_status(pathname, body))
+
+        class Server(http.server.ThreadingHTTPServer):
+            def server_bind(self) -> None:
+                # Not HTTPServer's: it names the host by reverse DNS (socket.getfqdn),
+                # which waits 35 s where no resolver answers (GitHub's Macs). Unread here.
+                socketserver.TCPServer.server_bind(self)
+                self.server_name, self.server_port = self.server_address[:2]
 
         self.root_provider = root_provider
-        self._httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._httpd = Server(("127.0.0.1", 0), Handler)
         self._httpd.daemon_threads = True
         self.port = self._httpd.server_address[1]
         import threading
@@ -1146,6 +1685,8 @@ def max_output_size(job: Mapping[str, object]) -> tuple[int, int]:
     heights = [int(output.get("height") or SIMPLE_RENDER_HEIGHT) for output in outputs if is_plain_object(output)]
     return max(widths or [SIMPLE_RENDER_WIDTH], default=SIMPLE_RENDER_WIDTH), max(heights or [SIMPLE_RENDER_HEIGHT], default=SIMPLE_RENDER_HEIGHT)
 async def with_snapshot_timeout(awaitable: Any, timeout_seconds: object, label: str = "snapshot") -> object:
+    # `timeoutSeconds` was validated when the job was prepared (normalize_common_job),
+    # so nothing can fail here between creating the awaitable and awaiting it.
     timeout = max(1, float(timeout_seconds or DEFAULT_TIMEOUT_SECONDS))
     try:
         return await asyncio.wait_for(awaitable, timeout=timeout)
@@ -1153,8 +1694,9 @@ async def with_snapshot_timeout(awaitable: Any, timeout_seconds: object, label: 
         raise SnapshotError(f"{label} timed out after {timeout_seconds}s") from exc
 class BatchSnapshotRenderer:
     def __init__(self, runtime_dir: Path) -> None:
-        # Each skill bundles its own render.html/snapshot-render.js, so the driver is told
-        # where they are rather than locating them relative to itself.
+        # The driver is told where render.html/snapshot-render.js are rather than locating
+        # them relative to itself; start() is where their absence is reported, so that
+        # constructing a renderer stays free of filesystem work.
         self.runtime_dir = Path(runtime_dir)
         self.playwright = None
         self.browser = None
@@ -1167,31 +1709,45 @@ class BatchSnapshotRenderer:
     async def start(self) -> None:
         if self.started:
             return
+        # Before Playwright, before the asset server: a missing bundle otherwise surfaced
+        # as a blank page that had 404'd on its own script.
+        require_browser_runtime(self.runtime_dir)
         try:
             try:
                 self.asset_server = SnapshotAssetServer(lambda: self.active_root_path)
-            except OSError:
-                # No loopback socket (sandboxed run): bulk bytes fall back to
-                # the CDP route below — slower, never wrong.
-                self.asset_server = None
+            except OSError as exc:
+                # The loopback server is the ONLY transport for bulk mesh bytes.
+                # The old fallback (Playwright's route) hands every intercepted
+                # body to the driver as escaped text in one protocol message, so
+                # a large assembly killed the renderer with ERR_STRING_TOO_LONG
+                # and reported it as a lost driver connection. A snapshot that
+                # cannot bind a loopback socket must say so, not silently take
+                # the transport that fails on real models.
+                raise SnapshotError(
+                    "CAD snapshot needs a loopback HTTP server on 127.0.0.1 for its mesh "
+                    f"bytes and could not start one: {exc}. Allow a local socket "
+                    "(the port is ephemeral and never leaves this machine) and retry."
+                ) from exc
             try:
                 from playwright.async_api import async_playwright
             except ImportError as exc:
+                from cadgen._internal.launch import launch_command
+
+                # A dependency of every cadgen install, so this is an incomplete environment.
                 raise SnapshotError(
-                    "CAD snapshot requires the Python playwright package. "
-                    "Install the invoking skill's own requirements.txt (it ships playwright), "
-                    "then run `python -m playwright install chromium` if needed."
+                    "CAD snapshot requires the Python playwright package, which every cadgen "
+                    f"install includes. Run cadgen as the skills do: {launch_command()} ..."
                 ) from exc
             self.playwright = await async_playwright().start()
-            self.browser = await self.playwright.chromium.launch(
+            self.browser = await launch_with_browser(lambda: self.playwright.chromium.launch(
                 headless=True,
                 timeout=RENDER_BROWSER_STARTUP_TIMEOUT_MS,
-                # The page origin is the intercepted (insecure) snapshot.local,
-                # and its bulk assets 307 to the loopback server. Chromium's
-                # Private Network Access blocks insecure-public -> loopback
-                # subresources, which would silently force every byte back
-                # through the ~20 MB/s CDP fulfill path. This renderer loads
-                # no web content — only our own runtime and files.
+                # The intercepted localhost page and its 127.0.0.1 bulk server
+                # are distinct origins. Keep the Private Network Access flags
+                # that make this cross-origin loopback transport work across
+                # Chromium generations; otherwise a blocked redirect silently
+                # forces bytes back through the ~20 MB/s CDP fulfill path. This
+                # renderer loads no web content — only our own runtime and files.
                 # Feature names cover the PNA generations: Chromium ~94-130
                 # shipped BlockInsecurePrivateNetworkRequests + the two
                 # preflight flags; newer builds renamed the check to
@@ -1211,16 +1767,24 @@ class BatchSnapshotRenderer:
                     # platform default stands.
                     *(["--use-angle=metal"] if sys.platform == "darwin" else []),
                 ],
-            )
+            ))
             self.context = await self.browser.new_context(
                 viewport={"width": SIMPLE_RENDER_WIDTH, "height": SIMPLE_RENDER_HEIGHT},
                 device_scale_factor=1,
             )
             self.page = await self.context.new_page()
+            # The page addresses the cache server DIRECTLY. Injected before any
+            # page script so the runtime's provider is built with it (see the
+            # transport note above: an intercepted URL costs the pipe, even
+            # when the route only answers with a redirect).
+            await self.context.add_init_script(
+                f"window.__cadgenSnapshotAssetOrigin = {json.dumps(self.asset_server.base_url)};"
+            )
             await self.page.route(SNAPSHOT_ROUTE_GLOB, self.handle_route)
             await self.page.goto(SNAPSHOT_RENDER_URL, wait_until="load", timeout=DEFAULT_TIMEOUT_SECONDS * 1000)
             await self.page.wait_for_function(
-                "typeof window.__snapshotRender === 'function'",
+                "typeof window.__snapshotRender === 'function' && "
+                "typeof window.__snapshotRenderSequence === 'function'",
                 timeout=DEFAULT_TIMEOUT_SECONDS * 1000,
             )
             self.started = True
@@ -1232,22 +1796,20 @@ class BatchSnapshotRenderer:
         request = route.request
         parsed = urlparse(request.url)
         bulk = (
-            parsed.path.startswith(TESS_CACHE_ROUTE_PREFIX)
-            or parsed.path.startswith(RENDER_ASSET_ROUTE_PREFIX)
+            parsed.path.startswith(RENDER_ASSET_ROUTE_PREFIX)
             or parsed.path.startswith(STORE_ASSET_ROUTE_PREFIX)
         )
-        if bulk and self.asset_server is not None and request.url.startswith(SNAPSHOT_ORIGIN):
-            # 307 preserves method and body, so the cache write-back POST
-            # redirects too; the payload then rides the loopback socket
-            # instead of the CDP pipe (see the transport note above).
+        if bulk and request.url.startswith(SNAPSHOT_ORIGIN):
+            # These asset URLs are page-relative (the job names files, not
+            # origins), so they are intercepted and redirected: a tiny 307
+            # crosses the pipe and the payload rides the loopback socket. GETs
+            # only — nothing POSTs a body here, which is why the redirect is
+            # enough for them and not for the cache (see the transport note).
             await route.fulfill(
                 status=307,
                 headers={"location": f"{self.asset_server.base_url}{parsed.path}"},
                 body="",
             )
-            return
-        if parsed.path.startswith(TESS_CACHE_ROUTE_PREFIX):
-            await self.handle_tess_cache_route(route, request, parsed.path)
             return
         if request.method != "GET":
             await route.fulfill(status=405, content_type="text/plain; charset=utf-8", body="method not allowed")
@@ -1274,45 +1836,6 @@ class BatchSnapshotRenderer:
             body=file_path.read_bytes(),
         )
 
-    async def handle_tess_cache_route(self, route: Any, request: Any, pathname: str) -> None:
-        # Same origin gate the file routes get; the cache lives outside any
-        # model root, so it must never be reachable through a bad name.
-        if not request.url.startswith(SNAPSHOT_ORIGIN):
-            await route.fulfill(status=403, content_type="text/plain; charset=utf-8", body="forbidden")
-            return
-        if request.method == "GET":
-            body = read_tessellation_cache_entry(pathname)
-            if body is None:
-                await route.fulfill(status=404, content_type="text/plain; charset=utf-8", body="miss")
-                return
-            await route.fulfill(
-                status=200,
-                content_type="application/octet-stream",
-                headers={"cache-control": "no-store"},
-                body=body,
-            )
-            return
-        if request.method == "POST":
-            if pathname == TESS_CACHE_BATCH_PATH:
-                # CDP fallback for the batch route (no loopback server). The
-                # container crosses the slow fulfill path, but it is still one
-                # round trip instead of N.
-                batch = read_tessellation_cache_batch(request.post_data_buffer)
-                if batch is None:
-                    await route.fulfill(status=400, content_type="text/plain; charset=utf-8", body="bad batch request")
-                    return
-                await route.fulfill(
-                    status=200,
-                    content_type="application/octet-stream",
-                    headers={"cache-control": "no-store"},
-                    body=batch,
-                )
-                return
-            accepted = write_tessellation_cache_entry(pathname, request.post_data_buffer)
-            await route.fulfill(status=204 if accepted else 403, content_type="text/plain; charset=utf-8", body="")
-            return
-        await route.fulfill(status=405, content_type="text/plain; charset=utf-8", body="method not allowed")
-
     async def render(self, job: Mapping[str, object]) -> dict[str, object]:
         await self.start()
         resolved = job.get("resolved") if is_plain_object(job.get("resolved")) else {}
@@ -1328,6 +1851,165 @@ class BatchSnapshotRenderer:
             message = result.get("error") if is_plain_object(result) else ""
             raise SnapshotError(str(message or "unknown browser snapshot failure"))
         return result
+
+    async def render_video(
+        self,
+        job: Mapping[str, object],
+        *,
+        progress: object | None = None,
+        narrate: object | None = None,
+    ) -> dict[str, object]:
+        """Render one job's animation clip as a video and report what was written.
+
+        The page prepares the source, embedded animation and model ONCE and
+        then answers one capture request per frame: fetching and tessellating a
+        document 1800 times is not a slower video, it is no video at all. The
+        frames come back a PNG at a time for the same reason the mesh bytes ride
+        a loopback socket (see the transport note above) -- an array of every
+        frame is a protocol message no driver pipe can carry.
+
+        The frames land in a temp directory and ffmpeg encodes them. Neither the
+        frames nor their bytes appear in the result: what a caller gets is the
+        path, which is what it asked for.
+
+        ``narrate`` is how a video says what it is doing where nothing paints a
+        bar. This is the one render whose work is measured in thousands of units
+        and tens of minutes, and a run from a script or an agent's tool call has
+        no tty -- so the frame counter below reaches nobody there. A caller that
+        IS painting passes nothing and gets none of these lines.
+        """
+        import tempfile
+
+        from cadgen.snapshot_video import (
+            VIDEO_FRAME_PATTERN,
+            encode_video,
+            video_container_for_path,
+        )
+
+        await self.start()
+        report = resolve_progress(progress)
+        say = narrate if callable(narrate) else (lambda message: None)
+        resolved = job.get("resolved") if is_plain_object(job.get("resolved")) else {}
+        self.active_root_path = Path(str(resolved.get("rootPath") or "")).resolve()
+        width, height = max_output_size(job)
+        await self.page.set_viewport_size({"width": width, "height": height})
+        timeout_seconds = job.get("timeoutSeconds") or DEFAULT_TIMEOUT_SECONDS
+        video = job["video"] if is_plain_object(job.get("video")) else {}
+        output = job["outputs"][0]
+        output_path = Path(str(output.get("path") or ""))
+        container = video_container_for_path(str(output_path))
+
+        # The preparation loads, builds, and walks the clip once to find the
+        # bounds the camera is locked to, so on a very long clip it is the one
+        # call whose cost grows with the frame count. It shares the job's
+        # `timeoutSeconds` with everything else; a clip that needs longer than
+        # that to be MEASURED raises it there.
+        report.detail(f"{job.get('input') or ''} (preparing)")
+        say(f"video: preparing {job.get('input') or ''}")
+        prepared = await with_snapshot_timeout(
+            self.page.evaluate("(renderJob) => window.__snapshotRenderSequence(renderJob)", dict(job)),
+            timeout_seconds,
+            "video preparation",
+        )
+        if not is_plain_object(prepared) or not prepared.get("ok"):
+            raise SnapshotError("the browser could not prepare the video sequence")
+        # The frame count comes from the PAGE because the clip does: choreography
+        # is JavaScript, so the duration and the loop flag that decide the default
+        # span are only readable there.
+        frames = int(prepared.get("frames") or 0)
+        fps = int(prepared.get("fps") or video.get("fps") or 0)
+        seconds = float(prepared.get("seconds") or 0.0)
+        warnings: list[str] = []
+        # The camera the PAGE resolved, reported the way a still reports it. The
+        # request is not a substitute: an explicit-position camera is an object,
+        # and echoing it puts a Python repr in a machine-readable field.
+        resolved_camera = ""
+        # Said before frame 0, because it is the only disclosure of how long this
+        # will run: a typo'd `{"seconds": 300, "fps": 120}` and a deliberate 20 s
+        # clip look identical from outside until the frame total is named.
+        say(f"video: {frames} frames at {fps} fps ({seconds:g}s) -> {output_path}")
+        counted_at = time.perf_counter()
+        try:
+            with tempfile.TemporaryDirectory(prefix="cadgen-video-") as frames_dir:
+                frames_path = Path(frames_dir)
+                # A frame is a unit of work the caller can watch. Under the
+                # packet's job counter a 1800-frame render reports 0/1 for
+                # minutes; the packet loop restores its own total afterwards.
+                report.phase(PHASE_RENDER, total=frames, detail=str(job.get("input") or ""))
+                for index in range(frames):
+                    frame = await with_snapshot_timeout(
+                        self.page.evaluate(
+                            "(index) => window.__snapshotRenderSequenceFrame(index)", index
+                        ),
+                        timeout_seconds,
+                        f"video frame {index}",
+                    )
+                    if not is_plain_object(frame) or not frame.get("dataUrl"):
+                        raise SnapshotError(f"the browser returned no image for video frame {index}")
+                    match = re.match(r"^data:([^;]+);base64,(.+)$", str(frame["dataUrl"]))
+                    if not match:
+                        raise SnapshotError(f"video frame {index} did not include a base64 data URL")
+                    (frames_path / (VIDEO_FRAME_PATTERN % index)).write_bytes(
+                        base64.b64decode(match.group(2))
+                    )
+                    resolved_camera = resolved_camera or str(frame.get("camera") or "")
+                    report.advance()
+                    # On the clock rather than every N frames: one frame is
+                    # milliseconds on a bracket and seconds on an assembly, and
+                    # what a watcher needs is evidence of movement at a human
+                    # rate either way.
+                    if time.perf_counter() - counted_at >= VIDEO_NARRATE_INTERVAL_SECONDS:
+                        counted_at = time.perf_counter()
+                        say(f"video: frame {index + 1}/{frames}")
+                say(f"video: encoding {frames} frames as {container}")
+                encode_video(
+                    frames_path,
+                    output_path=output_path,
+                    fps=fps,
+                    container=container,
+                    quality=str(video.get("quality") or ""),
+                    loop=bool(video.get("loop", True)),
+                )
+        finally:
+            # The prepared model holds GPU buffers for the whole encode, so it is
+            # freed whatever happened -- and a teardown that fails must not mask
+            # the failure that got us here. It is on a timeout of its own for the
+            # same reason: cancelling a frame's await does not stop the
+            # JavaScript it was waiting on, so a clip that wedges inside
+            # `update` leaves this call queued behind it, and an untimed await
+            # here would swallow the frame timeout the caller needs to see.
+            try:
+                teardown = await with_snapshot_timeout(
+                    self.page.evaluate("() => window.__snapshotRenderSequenceDispose()"),
+                    VIDEO_TEARDOWN_TIMEOUT_SECONDS,
+                    "video teardown",
+                )
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                teardown = None
+            if is_plain_object(teardown):
+                warnings = [str(warning) for warning in (teardown.get("warnings") or [])]
+        return {
+            "ok": True,
+            "mode": "view",
+            "outputs": [
+                {
+                    "path": str(output_path),
+                    "camera": resolved_camera,
+                    "width": width,
+                    "height": height,
+                    "mimeType": f"video/{container}",
+                    # The encoder already wrote the file, so this output carries
+                    # a DESCRIPTION rather than bytes -- see write_output_payload.
+                    "video": {
+                        "frames": frames,
+                        "fps": fps,
+                        "seconds": seconds,
+                        "start": float(prepared.get("start") or 0.0),
+                    },
+                }
+            ],
+            "warnings": warnings,
+        }
 
     async def close(self) -> None:
         if self.asset_server is not None:
@@ -1368,17 +2050,69 @@ class BatchSnapshotRenderer:
 
 
 
+def _browser_stage_timings(value: object) -> dict[str, object]:
+    """Keep measured durations, never the browser's image payload or metadata."""
+    if not is_plain_object(value):
+        return {}
+
+    def durations(source: Mapping[str, object], fields: tuple[str, ...]) -> dict[str, object]:
+        measured = {}
+        for name in fields:
+            duration = source.get(name)
+            if type(duration) not in (int, float):
+                continue
+            try:
+                valid = isfinite(duration) and duration >= 0
+            except OverflowError:
+                valid = False
+            if valid:
+                measured[name] = duration
+        return measured
+
+    timings = durations(value, (
+        "loadSourceMs", "preparePoseMs", "buildModelMs", "prepareViewportMs",
+        "waitViewportMs", "captureMs",
+    ))
+    source_load = value.get("sourceLoad")
+    if is_plain_object(source_load):
+        measured = durations(source_load, (
+            "probeMs", "cacheReadMs", "cacheDecodeMs", "meshBuildMs", "surfaceReadMs",
+            "tessellateMs", "cacheWriteMs", "composeMs",
+        ))
+        for name in ("componentCount", "cacheBatchCount", "cacheHitCount", "cacheMissCount"):
+            count = source_load.get(name)
+            if type(count) is int and 0 <= count <= 2**53 - 1:
+                measured[name] = count
+        if measured:
+            timings["sourceLoad"] = measured
+    outputs = []
+    for output in value.get("outputs", []) if isinstance(value.get("outputs"), list) else []:
+        if not is_plain_object(output):
+            continue
+        measured = durations(output, (
+            "updateModelMs", "frameCameraMs", "prepareStudioMs", "drawSubmitMs", "encodeImageMs",
+        ))
+        if measured:
+            if isinstance(output.get("path"), str) and output["path"]:
+                measured = {"path": output["path"], **measured}
+            outputs.append(measured)
+    if outputs:
+        timings["outputs"] = outputs
+    return timings
+
+
 async def render_resolved_job_packet(
     packet: Mapping[str, object],
     *,
     runtime_dir: Path,
     renderer: BatchSnapshotRenderer | None = None,
     progress: object | None = None,
+    narrate: object | None = None,
 ) -> dict[str, object]:
     snapshot_renderer = renderer or BatchSnapshotRenderer(runtime_dir)
-    # The CLI already cleared these before resolution; repeating it costs an
-    # unlink of an absent file and makes the invariant hold for a caller that
-    # builds a packet itself and comes straight here.
+    # The CLI already cleared these once the request was prepared; repeating it
+    # costs an unlink of an absent file and makes the invariant hold for a caller
+    # that builds a packet itself and comes straight here.
     clear_render_output_targets(packet["jobs"])
     report = resolve_progress(progress)
     started = time.perf_counter()
@@ -1388,18 +2122,31 @@ async def render_resolved_job_packet(
     # than a number formatted into a phase name. Same shape as meshing components.
     report.phase(PHASE_RENDER, total=total)
     try:
-        for job in packet["jobs"]:
+        for index, job in enumerate(packet["jobs"]):
             report.detail(str(job.get("input") or ""))
-            result = await snapshot_renderer.render(job)
-            # The browser result knows nothing about artifact resolution; --debug
-            # diagnostics are attached at resolve time, so merge them into the
-            # emitted result here or they never reach --json output.
+            if job.get("video") is not None:
+                result = await snapshot_renderer.render_video(
+                    job, progress=report, narrate=narrate
+                )
+                # A video counts FRAMES, not jobs, so render_video re-entered
+                # the phase with its own total; the packet's counter is restored
+                # here with the jobs already finished credited to it.
+                report.phase(PHASE_RENDER, total=total, detail=str(job.get("input") or ""))
+                report.advance(index + 1)
+            else:
+                result = await snapshot_renderer.render(job)
+                report.advance()
+            # Keep resolution and measured browser work together under --debug.
+            # The typed result otherwise intentionally drops browser internals.
             resolved = job.get("resolved") if is_plain_object(job.get("resolved")) else {}
-            debug_info = resolved.get("debug")
-            if is_plain_object(debug_info) and is_plain_object(result):
+            debug_info = dict(resolved["debug"]) if is_plain_object(resolved.get("debug")) else {}
+            if job.get("debug"):
+                stages = _browser_stage_timings(result.get("stageTimings"))
+                if stages:
+                    debug_info["stageTimings"] = stages
+            if debug_info:
                 result = {**result, "debug": debug_info}
             results.append(result if packet["single"] else {"input": job.get("input"), **result})
-            report.advance()
     finally:
         await snapshot_renderer.close()
     if packet["single"]:
@@ -1423,6 +2170,12 @@ def write_output_payload(output: Mapping[str, object]) -> None:
     """
     output_path = str(output.get("path") or "")
     if not output_path:
+        return
+    if is_plain_object(output.get("video")):
+        # A video was written by the encoder, through this same temp-plus-rename
+        # contract, as the last step of its render. The output carries what the
+        # file IS -- frames, fps, seconds -- and no bytes at all, which is the
+        # point: a 1800-frame sequence has no payload that could ride a result.
         return
     path = Path(output_path)
     text = output.get("text")
@@ -1461,7 +2214,7 @@ def write_render_outputs(result: Mapping[str, object]) -> None:
 # one in the browser reaches stdout by default. A SnapshotResult cannot carry a
 # payload at all, because it has no field for one -- and `--json` becomes
 # `dataclasses.asdict`, the same serialization every other cadgen verb uses
-# (design/format-doors.md).
+# (cadgen.results).
 
 
 def _output_kind(output: Mapping[str, object], path: Path) -> str:
@@ -1531,6 +2284,9 @@ def snapshot_result(
             if not is_plain_object(output) or not output.get("path"):
                 continue
             path = Path(str(output["path"]))
+            # A video's span, or zeros for a still. The frames are the FILE, so
+            # nothing here carries their bytes (see the note above).
+            video = output.get("video") if is_plain_object(output.get("video")) else {}
             files.append(
                 SnapshotFile(
                     path=path,
@@ -1543,18 +2299,20 @@ def snapshot_result(
                     ),
                     input=input_text,
                     tree=document_hash,
+                    frames=int(video.get("frames") or 0),
+                    fps=int(video.get("fps") or 0),
+                    seconds=float(video.get("seconds") or 0.0),
                 )
             )
         parts.extend(part for part in (job_result.get("parts") or []) if is_plain_object(part))
         warnings.extend(str(warning) for warning in (job_result.get("warnings") or []))
         info = job_result.get("debug")
         if is_plain_object(info):
-            # --debug diagnostics are attached at RESOLVE time and merged into the
-            # browser result by the render loop; the input rides alongside so a
-            # multi-job packet's entries stay attributable.
+            # Resolution and browser diagnostics are merged by the render loop;
+            # selected input identity attributes single and multi-job entries.
             entry = dict(info)
-            if job_result.get("input"):
-                entry = {"input": str(job_result["input"]), **entry}
+            if input_text or job_result.get("input"):
+                entry = {"input": input_text or str(job_result["input"]), **entry}
             debug.append(entry)
     return SnapshotResult(
         ok=bool(result.get("ok", True)) and all(job.get("ok") is not False for job in job_results),
@@ -1572,18 +2330,23 @@ async def render_snapshot(
     runtime_dir: Path,
     renderer: BatchSnapshotRenderer | None = None,
     progress: object | None = None,
+    narrate: object | None = None,
 ) -> SnapshotResult:
     """Render a resolved packet, write its outputs, and report what was written.
 
     The three steps are one call because their ORDER is the exact-path contract:
-    every declared target was cleared before resolution, the bytes land through a
+    every declared target was cleared before anything was built, the bytes land through a
     temp file and a rename, and only then does anything describe them. A caller
     that could render without writing could also be handed a path holding
     nothing.
     """
     started = time.perf_counter()
     result = await render_resolved_job_packet(
-        packet, runtime_dir=runtime_dir, renderer=renderer, progress=progress
+        packet,
+        runtime_dir=runtime_dir,
+        renderer=renderer,
+        progress=progress,
+        narrate=narrate,
     )
     write_render_outputs(result)
     return snapshot_result(

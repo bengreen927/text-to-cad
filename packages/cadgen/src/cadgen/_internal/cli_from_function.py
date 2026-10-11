@@ -1,4 +1,4 @@
-"""Derive a CLI from a public verb function's signature (design/format-doors.md).
+"""Derive a CLI from a public verb function's signature (README law 6).
 
 A *mirror* command is one whose parser is GENERATED from the function it calls,
 so a flag and a parameter cannot drift: adding a keyword-only argument adds a
@@ -23,6 +23,14 @@ an argument-parsing framework:
 * The return value is a dataclass: ``--json`` serializes it to one line,
   otherwise it prints human lines. A raised exception becomes
   ``{"ok": false, "error": ...}`` + exit 1.
+* A flag the verb USED to take is declared on the function as
+  ``__cadgen_retired_options__`` (see :func:`retired_options`). It is the one
+  thing in a generated parser that is not a parameter, because a deleted
+  parameter leaves nothing behind to derive from: without it a hard cutover
+  reaches the user as argparse's ``unrecognized arguments``, which names no
+  reason and no replacement, and law 8 ("every retired surface fails loudly
+  with a teaching error naming its replacement") is not satisfied by an error
+  that happens to exist.
 
 Stdlib only, and light: building a parser at dispatch costs microseconds, and
 nothing here may pull the CAD stack in — ``cadgen <verb> --help`` must stay off
@@ -37,6 +45,7 @@ import dataclasses
 import importlib
 import inspect
 import json
+import os
 import re
 import sys
 import types
@@ -62,6 +71,48 @@ _SCALARS: dict[Any, Callable[[str], Any]] = {
 
 class NotDerivable(TypeError):
     """The function is outside the mirror subset; it must be an adapter."""
+
+
+# The attribute a verb declares its retired flags on: ``{"--flag": "why it is
+# gone and what to do instead"}``. Metadata rather than a parameter, because
+# the whole point is that the parameter is gone.
+RETIRED_ATTRIBUTE = "__cadgen_retired_options__"
+
+
+class RetiredOption(Exception):
+    """A flag this command used to take, refused by name.
+
+    Raised out of :meth:`argparse.ArgumentParser.parse_args` the moment the
+    option string is seen, so the flag is REFUSED rather than accepted and
+    ignored. :func:`run_cli` turns it into the message alone on stderr and exit
+    2 -- the same shape as a retired COMMAND (``cadgen.cli._RETIRED``), minus
+    the usage dump that buries the teaching in a wall of live flags.
+    """
+
+
+class _RetiredOptionAction(argparse.Action):
+    """The hidden parser entry that exists only to raise :class:`RetiredOption`.
+
+    ``nargs="?"`` so every spelling the flag ever had reaches it -- ``--camera
+    iso``, ``--camera=iso`` and a bare ``--view-labels`` alike -- and the
+    refusal is the flag's OWN message rather than argparse's report of how many
+    arguments it expected.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):  # noqa: ANN001
+        del namespace, values
+        raise RetiredOption(f"{parser.prog} no longer takes {option_string}: {self.const}")
+
+
+def retired_options(func: Callable[..., Any]) -> dict[str, str]:
+    """``{flag: teaching message}`` this verb declares, by its hard-cutover name.
+
+    The message says what the flag meant, why this command has no such thing,
+    and what to do instead; the flag and the command name are added by the
+    action, so a declaration never repeats them.
+    """
+    declared = getattr(func, RETIRED_ATTRIBUTE, None) or {}
+    return {str(flag): str(message) for flag, message in dict(declared).items()}
 
 
 def _scalar(annotation: Any, *, where: str) -> Any:
@@ -157,12 +208,42 @@ def parser_dests(parser: argparse.ArgumentParser) -> tuple[str, ...]:
     )
 
 
+def _flag_metavars(names: Sequence[str]) -> dict[str, str]:
+    """``{parameter: METAVAR}`` for a command's value-taking flags.
+
+    A metavar is the parameter's LAST word (``--mesh-tolerance TOLERANCE``).
+    Where two flags of one command would share it, each takes one more leading
+    word until they differ (``MESH_TOLERANCE`` / ``ANGULAR_TOLERANCE``), so a
+    usage line never shows two different values under one name."""
+    words = {name: name.split("_") for name in names}
+    depth = {name: 1 for name in names}
+    while True:
+        metavars = {name: "_".join(words[name][-depth[name]:]).upper() for name in names}
+        clashing = [
+            name for name in names
+            if sum(1 for other in names if metavars[other] == metavars[name]) > 1
+            and depth[name] < len(words[name])
+        ]
+        if not clashing:
+            return metavars
+        for name in clashing:
+            depth[name] += 1
+
+
 def cli_from_function(func: Callable[..., Any], *, prog: str) -> argparse.ArgumentParser:
     """The argparse parser this function's signature implies."""
     summary, param_help = parse_docstring(func.__doc__)
-    parser = argparse.ArgumentParser(prog=prog, description=summary)
+    # Generated commands have one exact signature-derived vocabulary. Prefix
+    # abbreviations would parse successfully but are not part of that surface,
+    # and make it impossible to tell which canonical keyword was supplied
+    # without reimplementing argparse's matching rules.
+    parser = argparse.ArgumentParser(prog=prog, description=summary, allow_abbrev=False)
     hints = _type_hints(func)
     where = func.__qualname__
+    metavars = _flag_metavars([
+        name for name, parameter in inspect.signature(func).parameters.items()
+        if parameter.kind is parameter.KEYWORD_ONLY and hints.get(name) is not bool
+    ])
     for name, parameter in inspect.signature(func).parameters.items():
         if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
             raise NotDerivable(f"{where}: variadic parameter {name!r} is not derivable")
@@ -182,7 +263,7 @@ def cli_from_function(func: Callable[..., Any], *, prog: str) -> argparse.Argume
                 # here read well for a `--tags TAG` and turned `--focus` into
                 # `FOCU`, so the repeatable-ness is stated in the help text
                 # instead, where it can be said in words.
-                metavar=name.rsplit("_", 1)[-1].upper(),
+                metavar=metavars[name],
                 help=help_text,
             )
             continue
@@ -201,7 +282,7 @@ def cli_from_function(func: Callable[..., Any], *, prog: str) -> argparse.Argume
                 flag,
                 type=base,
                 default=None if parameter.default is parameter.empty else parameter.default,
-                metavar=name.rsplit("_", 1)[-1].upper(),
+                metavar=metavars[name],
                 help=help_text,
             )
             continue
@@ -212,6 +293,27 @@ def cli_from_function(func: Callable[..., Any], *, prog: str) -> argparse.Argume
             options["nargs"] = "?"
             options["default"] = parameter.default
         parser.add_argument(name, **options)
+    # Retired flags are metadata on the verb, not parameters: they stay out of
+    # `--help` and out of `parser_dests` (so the signature-sync policy test
+    # still sees exactly the signature), they can never invoke the function,
+    # and they exist only so a hard cutover names its own replacement.
+    live = {"--" + name.replace("_", "-") for name in inspect.signature(func).parameters}
+    for flag, message in retired_options(func).items():
+        if not flag.startswith("--"):
+            raise NotDerivable(f"{where}: retired option {flag!r} must be a --long spelling")
+        if flag in live:
+            raise NotDerivable(
+                f"{where}: {flag} is declared retired but the signature still takes it -- "
+                "a flag is either a parameter or a retirement, never both"
+            )
+        parser.add_argument(
+            flag,
+            action=_RetiredOptionAction,
+            const=message,
+            nargs="?",
+            dest=argparse.SUPPRESS,
+            help=argparse.SUPPRESS,
+        )
     parser.add_argument(
         "--json",
         dest=JSON_FLAG_DEST,
@@ -222,11 +324,20 @@ def cli_from_function(func: Callable[..., Any], *, prog: str) -> argparse.Argume
 
 
 def _call_arguments(
-    func: Callable[..., Any], namespace: argparse.Namespace
+    func: Callable[..., Any],
+    namespace: argparse.Namespace,
+    *,
+    explicit_keywords: set[str] | None = None,
 ) -> tuple[list[Any], dict[str, Any]]:
     positional: list[Any] = []
     keywords: dict[str, Any] = {}
     for name, parameter in inspect.signature(func).parameters.items():
+        if (
+            parameter.kind is parameter.KEYWORD_ONLY
+            and explicit_keywords is not None
+            and name not in explicit_keywords
+        ):
+            continue
         value = getattr(namespace, name)
         if parameter.default == () and isinstance(parameter.default, tuple):
             # Repeatable flag: argparse appends into a list (None = never given).
@@ -236,6 +347,28 @@ def _call_arguments(
         else:
             positional.append(value)
     return positional, keywords
+
+
+def _explicit_option_dests(
+    parser: argparse.ArgumentParser, tokens: Sequence[str]
+) -> set[str]:
+    """Destinations whose option strings actually appeared in ``tokens``.
+
+    Parsing still exposes ordinary argparse defaults to parser consumers. Only
+    the generated invocation omits absent keyword arguments, which lets the
+    public function distinguish omission from an explicitly supplied default.
+    The mirror subset has no ambiguous short-option clusters: every generated
+    function option is one long ``--kebab-case`` spelling.
+    """
+    explicit: set[str] = set()
+    for token in tokens:
+        if token == "--":
+            break
+        option = token.split("=", 1)[0]
+        action = parser._option_string_actions.get(option)  # noqa: SLF001
+        if action is not None:
+            explicit.add(action.dest)
+    return explicit
 
 
 def _plain(value: Any) -> Any:
@@ -266,12 +399,63 @@ def result_lines(result: Any) -> list[str]:
     ]
 
 
+def report_failure(
+    exc: BaseException,
+    *,
+    prog: str,
+    as_json: bool,
+    verbose: bool = False,
+    verbose_hint: bool = True,
+    stdout: Any | None = None,
+    stderr: Any | None = None,
+) -> int:
+    """The ONE failure envelope of every cadgen command, and its exit code (1).
+
+    Under ``--json`` a failure is ``{"ok": false, "error": ...}`` on STDOUT -- the
+    result channel, so a caller parsing the last stdout line always finds an
+    answer; otherwise it is the one-line ``[tool] FAILED: ...`` report on stderr.
+    Shared by the generated doors (:func:`emit`) and the model-script runner
+    (``cadgen.cli._run_model``), which prints its own success lines and so cannot
+    go through :func:`emit` itself.
+
+    A failure that is a mistake in cadgen's own code, not the person's or one cadgen
+    raised on purpose, is also a crash telemetry reports (``cadgen.analytics.report``):
+    a build worker's goes to the daemon with its exit frame, a command's is handed to a
+    running daemon. Reporting it changes nothing here. In a build, why it failed is decided here too
+    (``cadgen.analytics.build_failure``), for the build's count (``cadgen.daemon.telemetry.job_failed``).
+    """
+    _report_crash(exc)
+    if as_json:
+        out = stdout if stdout is not None else sys.stdout
+        print(json.dumps({"ok": False, "error": str(exc)}, separators=(",", ":")), file=out)
+        return 1
+    from cadgen._internal.cli_errors import report_cli_error
+
+    return report_cli_error(
+        exc, tool=prog, verbose=verbose, verbose_hint=verbose_hint, stream=stderr
+    )
+
+
+def _report_crash(exc: BaseException) -> None:
+    try:
+        from cadgen import analytics
+        from cadgen.daemon import telemetry
+
+        building = bool(os.environ.get("CADGEN_DAEMON_CHILD")) or telemetry.building()
+        analytics.report(exc, "build" if building else "command", bugs_only=True)
+        if telemetry.building():
+            telemetry.job_failed(analytics.build_failure(exc))
+    except Exception:  # noqa: BLE001 - a crash report never fails a command's own report
+        pass
+
+
 def emit(
     invoke: Callable[[], Any],
     *,
     prog: str,
     as_json: bool,
     verbose: bool = False,
+    verbose_hint: bool = True,
     stdout: Any | None = None,
     stderr: Any | None = None,
 ) -> int:
@@ -286,12 +470,13 @@ def emit(
     try:
         result = invoke()
     except Exception as exc:  # noqa: BLE001 — the CLI boundary: report, do not traceback
-        if as_json:
-            print(json.dumps({"ok": False, "error": str(exc)}, separators=(",", ":")), file=out)
-            return 1
-        from cadgen._internal.cli_errors import report_cli_error
+        return report_failure(
+            exc, prog=prog, as_json=as_json, verbose=verbose, verbose_hint=verbose_hint,
+            stdout=out, stderr=stderr,
+        )
+    from cadgen.daemon import telemetry
 
-        return report_cli_error(exc, tool=prog, verbose=verbose, stream=stderr)
+    telemetry.job_result(result)  # in a build worker: whether what it made was the store's already
     if as_json:
         print(json.dumps(result_payload(result), separators=(",", ":")), file=out)
     else:
@@ -307,6 +492,7 @@ def call_verb(
     prog: str,
     as_json: bool,
     verbose: bool = False,
+    verbose_hint: bool = True,
     stdout: Any | None = None,
 ) -> int:
     """:func:`emit` for an adapter: it passes its own arguments to the verb."""
@@ -315,6 +501,7 @@ def call_verb(
         prog=prog,
         as_json=as_json,
         verbose=verbose,
+        verbose_hint=verbose_hint,
         stdout=stdout,
     )
 
@@ -329,13 +516,29 @@ def run_cli(
     """Parse ``argv`` against ``func``'s generated parser, call it, print the result."""
     tokens = list(argv) if argv is not None else sys.argv[1:]
     parser = cli_from_function(func, prog=prog)
-    args = parser.parse_args(tokens)
-    positional, keywords = _call_arguments(func, args)
+    try:
+        args = parser.parse_args(tokens)
+    except RetiredOption as retired:
+        # The message and nothing else. A usage line here would answer a
+        # question the caller did not ask ("what else does this take?") above
+        # the one they did ("why not this?"), and the flags it lists are the
+        # ones that survived -- which is what `--help` is for.
+        print(str(retired), file=sys.stderr)
+        return 2
+    positional, keywords = _call_arguments(
+        func,
+        args,
+        explicit_keywords=_explicit_option_dests(parser, tokens),
+    )
     return emit(
         lambda: func(*positional, **keywords),
         prog=prog,
         as_json=bool(getattr(args, JSON_FLAG_DEST)),
         verbose=bool(getattr(args, "verbose", False)),
+        # The verb's signature decides whether `--verbose` exists at all (only a
+        # `verbose` parameter generates it), so the failure hint follows the same
+        # source of truth instead of promising a flag this door does not have.
+        verbose_hint=hasattr(args, "verbose"),
         stdout=stdout,
     )
 

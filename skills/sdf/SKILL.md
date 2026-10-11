@@ -1,6 +1,7 @@
 ---
 name: sdf
-description: SDFormat/SDF model and world authoring, validation, and simulator handoff. Use for `.sdf` files, SDFormat XML, models, worlds, links, joints, poses, frames, inertials, visual/collision geometry, mesh URIs, sensors, lights, physics, plugins, includes, Gazebo, static SDF review, or simulator-specific metadata. Do not use for signed-distance-field geometry.
+description: SDFormat/SDF model and world authoring, validation, and simulator handoff. Use for `.sdf` files, SDFormat XML, models, worlds, links, joints, poses, frames, inertials, visual/collision geometry, mesh URIs, sensors, lights, physics, plugins, includes, Gazebo, static SDF review, or simulator-specific metadata. Do not use for signed-distance-field geometry. Open and visually review existing SDF files in CAD Viewer.
+license: MIT
 ---
 
 # SDF
@@ -17,18 +18,14 @@ The `.sdf` file is the source of truth: author and edit the XML directly. There 
 
 ## Setup
 
-This skill's commands are thin entrypoints over the `cadgen` distribution, which
-carries the Python build runtime and the JavaScript it executes. Install it once:
+Run cadgen through [uv](https://docs.astral.sh/uv/), so this skill's commands share
+one installation, and its warm build daemon, with the CAD app's server:
 
-```bash
-python -m pip install -r requirements.txt
-```
+- `cadgen` below means `uvx --no-config --managed-python --python 3.13 --from cadgen==0.7.20 cadgen`
+- `python` below means `uvx --no-config --managed-python --python 3.13 --from cadgen==0.7.20 python`
 
-Rendering additionally needs a browser, which pip cannot supply:
-
-```bash
-python -m playwright install chromium
-```
+The first run downloads that installation and the first snapshot its headless
+browser; later runs reuse both.
 
 ## Core rules
 
@@ -42,16 +39,36 @@ python -m playwright install chromium
 8. Do not infer spatial transforms from visual impression alone. Derive poses, axes, scale, mass, inertia, and frame names from upstream source data, drawings, simulator documentation, measured values, or explicit assumptions. Never freehand computed numbers — use formulas or a throwaway helper script (inertia tensors, unit conversions).
 9. When the robot already has a URDF, derive the SDF from it instead of re-authoring geometry; see `references/interoperability.md`.
 10. Regenerate upstream geometry, mesh, robot-description, render, topology, or package assets with their owning workflows before editing SDF that references them.
-11. After authoring, run available checks: bundled validation, optional `gz sdf --check`, simulator load, joint motion, and plugin/sensor startup.
+11. After authoring, run available checks: bundled validation (which runs `gz sdf --check` itself whenever `gz` is on PATH), simulator load, joint motion, and plugin/sensor startup.
 12. Report assumptions, skipped checks, unresolved resource paths, and target-specific compatibility risks.
 
 ## Scope
 
 Use this skill for SDFormat outputs. Do not use it for signed-distance-field modeling, raw geometry generation, planning semantics, or to paper over incorrect upstream robot/source data unless the task is explicitly simulator-only.
 
-## CAD Viewer Handoff
+## Show the model
 
-After completing SDF work that creates or modifies a `.sdf`, you must ALWAYS hand the explicit file path to `$cad-viewer` when that skill is installed. `$cad-viewer` must start CAD Viewer if it is not already running and return link(s) to the relevant created or updated file(s); if `$cad-viewer` is unavailable or startup fails, report that instead of silently omitting the handoff.
+Show the user each file you create or change, and any they ask to see. Snapshots and
+validation don't replace this.
+
+- If your tools include `cad_show` (your host may prefix it), use it with the file's
+  absolute path, and follow its description for when to call it again. `cad_view` reads
+  what the user selected; `cad_screenshot` shows you what they see. Neither is a review
+  of your own work.
+- Otherwise run the CAD Viewer, from any folder:
+
+  ```bash
+  cadgen viewer --host 127.0.0.1 --json --detach
+  ```
+
+  `--detach` returns once the viewer answers requests and leaves it running in the
+  background: always pass it, since a foreground viewer never exits (and piping its
+  output through `tail` can hide the URL for good). It starts this machine's one viewer,
+  or reuses it. Read `url` from its one JSON line (never guess the port), and for each
+  file return `url?file=<its URL-encoded absolute path>`. If it fails to launch, say so.
+
+Review placement, resources and joints. The viewer does not execute simulator
+plugins or validate dynamics; keep simulator checks separate.
 
 ## Workflow
 
@@ -61,12 +78,12 @@ After completing SDF work that creates or modifies a `.sdf`, you must ALWAYS han
 4. Author the XML directly, following the worked examples in `references/examples.md`.
 5. Validate the explicit target with `cadgen sdf validate`; treat bundled validation as a guardrail, not simulator proof.
 6. Run target-consumer smoke tests when available (`references/smoke-tests.md`).
-7. Hand the file to `$cad-viewer`. Static rendering does not execute SDF plugins or read file-authored motion metadata.
+7. Show the result ([Show the model](#show-the-model)). Static rendering does not execute SDF plugins or read file-authored motion metadata.
 8. Report checks run, checks skipped, and assumptions.
 
 ## Commands
 
-Run with the project or workspace Python environment. Treat `python` in examples as an interpreter placeholder; if bare `python` is unavailable, substitute `python3`, a project virtualenv interpreter, or the configured interpreter path. The validator uses only the Python standard library.
+Run `cadgen` as Setup defines it. `cadgen doctor <skill-dir>` reports the installation in use and checks that it is the one this skill pins — docs drift silently on another. Validation itself needs nothing beyond the Python standard library; only snapshots need the browser. Use `cadgen <verb> --help` for the complete current interface.
 
 ```bash
 cadgen sdf validate path/to/model.sdf
@@ -75,17 +92,16 @@ cadgen sdf validate path/to/model.sdf --json
 cadgen sdf snapshot path/to/model.sdf review.png
 ```
 
-The validator checks document shape, name scopes, pose/frame graphs, joints, geometry, mesh URIs, inertials, sensors, and plugins, and prints its findings plus a summary. One run validates ONE file: `--strict` treats warnings as failures and `--json` emits the machine-readable findings document. It exits nonzero if the target fails.
+The validator checks document shape, name scopes, pose/frame graphs, joints, geometry, mesh URIs, inertials, sensors, and plugins, and prints its findings plus a summary. One run validates ONE file: `--strict` treats warnings as failures and `--json` prints one line of `{"ok", "path", "issues": [{"severity", "code", "message", "element", "hint"}], "summary"}`, where `element` is the XML path. It exits nonzero if the target fails.
 
-Optional external checking:
+External checking is on by default:
 
 ```bash
-cadgen sdf validate path/to/model.sdf --gz-check auto
 cadgen sdf validate path/to/model.sdf --gz-check required
 cadgen sdf validate path/to/model.sdf --gz-check never
 ```
 
-`gz sdf --check` is optional target-consumer validation. It should be reported as skipped when unavailable unless explicitly required.
+`gz sdf --check` is target-consumer validation. `--gz-check auto` is the default: it runs when `gz` is on PATH, reporting `gz_check_passed` or the tool's own output as the error `gz_check_failed`, and otherwise notes `info: gz_check_unavailable` and carries on. An absent optional tool says nothing about the file, so it never fails a clean document and `--strict` does not change that. `--gz-check required` makes the tool mandatory — a missing `gz` is then an error — and `--gz-check never` skips it outright.
 
 ## Required report shape
 
@@ -97,7 +113,7 @@ Checks run:
 - bundled SDF validation: passed
 - gz sdf --check: skipped, gz not installed
 - simulator load: skipped, target simulator unavailable
-- viewer handoff: `$cad-viewer` link returned
+- viewer review: live link returned, or explicit launch failure
 Assumptions:
 - Assumed mesh units are meters.
 - Assumed lidar frame is coincident with lidar_link.
@@ -116,14 +132,20 @@ cadgen sdf snapshot path/to/robot.sdf review.png
 ```
 
 It accepts `.sdf` only (a format door, same `TARGET [OUT]` grammar as the rest). Pose the robot with `--joint-values` — `{joint: degrees}` JSON,
-joints you do not name staying at the rest pose (the `"jointValues"` job field is the same
-thing in a packet). Robots are authored in metres and are framed on the robot scene scale
-automatically.
+joints you do not name staying at their defaults, where the CAD Viewer opens the robot (the
+`"jointValues"` job field is the same thing in a packet). The snapshot draws the robot with the
+viewer's own scene, so it shows what the viewer shows, and a link mesh that cannot be loaded
+fails it rather than leaving the link out. Robots are authored in metres and are framed on the
+robot scene scale automatically.
 
-Theme settings live under one `--theme`, mirroring the viewer's Theme tab. The default
-theme is `snapshot` — Workbench Light with the ground grid, origin axis and shadows
-removed, because in a still image those read as geometry. There is no `--display`: display
-settings (mode, clip, exploded, edges) are CAD topology settings, and a robot carries none.
+A normal snapshot uses the Solid preset and Light appearance; omitted groups inherit preset defaults.
+Pass `--display render` for the shared photographic scene. Inline display JSON and
+JSON files use grouped settings such as `lighting`, `background`, and `floor`;
+`appearance` is `light` (default) or `dark`. Projection and focal length belong
+in `display.camera`. Top-level `--camera` and `--joint-values` remain active in every display
+mode. The display modes are `solid` and `render`: `edges`, `clip`, `exploded`, the
+`xray`, `hidden-line` and `wireframe` modes and the `hidden`/`off` surface styles
+describe a STEP model's CAD edges, parts and solids, and are refused by name here.
 
 Link meshes are resolved relative to the description, so they must be present: an
 unhydrated Git LFS pointer fails as "No link mesh loaded for robot". Run

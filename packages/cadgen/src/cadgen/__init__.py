@@ -1,5 +1,6 @@
 """Shared CAD artifact generation runtime."""
 
+from functools import cache as _cache
 from typing import TYPE_CHECKING
 
 # Before anything imports build123d, which every cadgen entry point eventually does:
@@ -8,8 +9,8 @@ from typing import TYPE_CHECKING
 # with it (issue #322, upstream in build123d's register_folder). This hides
 # unparseable fonts from that one listing.
 #
-# It belongs here rather than in a launcher because the skill shims, the daemon's warm
-# workers and `python -m cadgen.X` children all reach cadgen by different routes, and a
+# It belongs here rather than in a launcher because the `cadgen` front door, the daemon's
+# warm workers and `python -m cadgen.X` children all reach cadgen by different routes, and a
 # fix that covered only one of them would leave the builds it spawns still broken.
 #
 # Cost where nothing is wrong: one str.endswith per glob call. CADGEN_FONT_GUARD=0
@@ -41,10 +42,10 @@ __all__ = [
     "MateTarget",
     "compound_from_instances",
     "read_step",
-    "load_step_scene",
-    "located_shape",
-    "occurrence_selector_id",
-    "scene_occurrence_shape",
+    "read_scene",
+    "StepScene",
+    "Occurrence",
+    "Selection",
     "ensure_step_topology_artifact",
     "label_text",
     "label_shape",
@@ -57,15 +58,15 @@ __all__ = [
 def __getattr__(name: str):
     if name in {"step", "dxf", "stl", "glb", "threemf"}:
         # A FORMAT NAMESPACE: the declaration decorator and the format's verbs in
-        # one callable module (design/format-doors.md). Returning the module
-        # rather than cadgen.authoring.<name> keeps a single identity —
+        # one callable module (cadgen._internal.format_namespace). Returning the
+        # module rather than cadgen.authoring.<name> keeps a single identity —
         # `import cadgen.stl` would otherwise shadow the decorator.
         import importlib
 
         return importlib.import_module(f"cadgen.{name}")
     if name in {"revolute", "slider", "cylindrical", "fastened", "couple"}:
         # Typed-mates kinematics vocabulary for the kinematics= dict on
-        # @step/@stl/@glb/@threemf (design/pose-animation-split.md).
+        # @step/@stl/@glb/@threemf.
         from cadgen import kinematics
 
         return getattr(kinematics, name)
@@ -90,7 +91,8 @@ def __getattr__(name: str):
             "label_shape": label_shape,
             "target": target,
         }[name]
-    if name in {"read_step", "load_step_scene", "located_shape", "occurrence_selector_id", "scene_occurrence_shape"}:
+    if name in {"read_step", "read_scene", "StepScene", "Occurrence", "Selection",
+                "load_step_scene", "located_shape", "occurrence_selector_id", "scene_occurrence_shape"}:
         from cadgen import step_scene
 
         return getattr(step_scene, name)
@@ -118,27 +120,38 @@ if TYPE_CHECKING:
     # from their real modules now.
     from cadgen import build123d, dxf, glb, step, stl, threemf
     from cadgen.assembly import AssemblyHelper, MateTarget, label_shape, label_text, target
-    from cadgen.color import linear_to_srgb, srgb, srgb_to_linear
+    from cadgen.color import (
+        srgb,
+        # __getattr__ serves these two without advertising them in __all__;
+        # the alias is how the mirror says "re-export" rather than "unused".
+        linear_to_srgb as linear_to_srgb,
+        srgb_to_linear as srgb_to_linear,
+    )
     from cadgen.kinematics import couple, cylindrical, fastened, revolute, slider
     from cadgen.instances import compound_from_instances
     from cadgen.progress import report, track
     from cadgen.step_scene import (
         read_step,
-        load_step_scene,
-        located_shape,
-        occurrence_selector_id,
-        scene_occurrence_shape,
+        read_scene,
+        StepScene,
+        Occurrence,
+        Selection,
     )
     from cadgen.step_topology_artifact import ensure_step_topology_artifact
 
 
+@_cache
 def _resolve_version() -> str:
     """The installed distribution version, falling back to pyproject in a source tree.
 
     Installed metadata is the authority: it is what a consumer actually has, and it is
-    what the skill shims compare their pinned requirement against. A bare source checkout
+    what `cadgen doctor` compares a skill's pinned requirement against. A bare source checkout
     has no metadata, so fall back to the pyproject this file ships beside — release
     tooling stamps it from the canonical VERSION, so the two never disagree.
+
+    Resolved once per process. The lookup lists every folder on ``sys.path``, and a
+    build puts the model's own folder there, which every save changes; the code that
+    answers cannot change under a running process anyway.
     """
     from importlib.metadata import PackageNotFoundError, version
 

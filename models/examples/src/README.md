@@ -1,11 +1,12 @@
 # examples models
 
 Standalone demo parts as one cad-project: every script directly under
-`src/` is a runnable part model and its artifact lands in a format folder at
-the project root (`STEP/`, `STL/`, `3MF/`, `GLB/`). Assemblies live in the
+`src/` is runnable and its artifact lands in a format folder at the project
+root (`STEP/`, `STL/`, `3MF/`, `GLB/`, `PDF/`). All but one are part models;
+`electronics_enclosure_base_drawing.py` is an `@eng_drawing` document over the
+part beside it, which is why it imports that model's constants. Assemblies live in the
 sibling `models/assemblies/` project (one group per assembly) and 2D drawings
-in `models/drawings/`. Nothing here is committed except this `src/` tree and
-`imported/` — build what you need.
+in `models/drawings/`. The `src/` tree is committed; build the outputs you need.
 
 ```bash
 python models/examples/src/mounting_plate.py     # one model
@@ -21,9 +22,6 @@ no path setup.
 A handful of models declare mesh exports so the STL/3MF/GLB doors have real
 fixtures to work against.
 
-`imported/import-smoke.step` is a committed SOURCE file (the viewer launch
-test's fixture), not an output.
-
 ### Parts
 
 | Script | Artifact | Description |
@@ -36,6 +34,7 @@ test's fixture), not an output.
 | `cylindrical_cap.py` | `STEP/cylindrical_cap.step` | Cylindrical cap with hollow interior, top boss, and rounded external edges |
 | `cylindrical_spacer_sleeve.py` | `STEP/cylindrical_spacer_sleeve.step` | Cylindrical spacer sleeve with a central through-bore and rounded rim edges |
 | `electronics_enclosure_base.py` | `STEP/electronics_enclosure_base.step` | Single solid open-top electronics enclosure base |
+| `electronics_enclosure_base_drawing.py` | `PDF/electronics_enclosure_base_drawing.pdf` | **Engineering drawing** (`@eng_drawing`) of that part: three views with hidden lines and centre marks, measured dimensions, hole callouts, title block. Run the model above first. |
 | `flywheel_disk.py` | `STEP/flywheel_disk.step` | Flywheel disk with central bore, annular rim, and lightening holes |
 | `gusset_plate.py` | `STEP/gusset_plate.step` | Gusset plate with a triangular web, base holes, and softened perimeter edges |
 | `keyed_shaft_hub.py` | `STEP/keyed_shaft_hub.step` | Keyed shaft hub with central bore, keyway slot, and bolt-hole pattern |
@@ -57,4 +56,3 @@ test's fixture), not an output.
 | `t_slot_slider_block.py` | `STEP/t_slot_slider_block.step` | T-slot slider block with central channel, side relief cuts, and mounting holes |
 
 Build: `python src/<script>` per row; unchanged models are no-ops.
-Imported sources: `imported/import-smoke.step` (committed, no script).

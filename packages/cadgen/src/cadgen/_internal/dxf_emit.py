@@ -1,9 +1,9 @@
 """The DXF emitter: build123d geometry in, deterministic DXF bytes out.
 
 ``@dxf`` follows ``@step``'s division of labor — *the function returns content,
-the engine owns serialization* (design/dxf-build123d.md). A drawing generator
-returns build123d 2D geometry and never touches ezdxf; everything below is the
-engine side of that contract.
+the engine owns serialization*. A drawing generator returns build123d 2D
+geometry and never touches ezdxf; everything below is the engine side of that
+contract.
 
 Three steps, in order:
 
@@ -59,7 +59,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; this module must not import OCP eagerly
-    from build123d import Edge, Shape
+    from build123d import Edge
 
 # The layer a bare shape lands on. Layers are CAM operations (CUT / ENGRAVE /
 # SCORE); a drawing that has only one does not need to name it.

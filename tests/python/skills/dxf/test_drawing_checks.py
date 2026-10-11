@@ -1,6 +1,5 @@
 """Tests for the generation-time DXF drawing checks."""
 
-import re
 import unittest
 from pathlib import Path
 
@@ -42,12 +41,6 @@ class LayerIntentTests(unittest.TestCase):
         self.assertFalse(layer_allows_open_geometry("PREFORM"))
         self.assertTrue(layer_allows_open_geometry("BEND"))
 
-    def test_render_kind_matches_validation_intent(self) -> None:
-        from cadgen.drawing_render import _semantic_kind_for_layer
-
-        for name in ("BEND", "PREFORM", "ENGRAVE", "NOTES", "CUT"):
-            self.assertEqual(layer_intent(name), _semantic_kind_for_layer(name))
-
 
 class DrawingChecksTests(unittest.TestCase):
     def test_full_circle_arc_is_valid(self) -> None:
@@ -86,6 +79,23 @@ class DrawingChecksTests(unittest.TestCase):
         modelspace.add_line((100, 100), (120, 100), dxfattribs={"layer": "CUT"})
 
         self.assertIn("open_cut_profile", _codes(validate_drawing_document(document)))
+
+    def test_closure_survives_a_rounding_boundary_tie(self) -> None:
+        # Two lines sharing both endpoints, but each endpoint independently computed
+        # (e.g. via analytic bend allowances) so it lands a fraction of a micron on
+        # either side of the 6-decimal rounding boundary -- reproduces the tom-cad
+        # report of a single valid closed face reading as `open_cut_profile` with
+        # endpoints like (-5.5, -68.150754) vs (-5.5, -68.150753), under 1e-6 mm apart.
+        document = _new_document()
+        modelspace = document.modelspace()
+        y = -68.1507535532376
+        start_a, start_b = (-5.5, y), (-5.5, y + 4e-7)
+        end_a, end_b = (10.0, 20.0), (10.0, 20.0 - 3e-7)
+        modelspace.add_line(start_a, end_a, dxfattribs={"layer": "CUT"})
+        modelspace.add_line(end_b, start_b, dxfattribs={"layer": "CUT"})
+
+        codes = _codes(validate_drawing_document(document))
+        self.assertNotIn("open_cut_profile", codes)
 
     def test_zero_length_and_duplicate_entities_are_errors(self) -> None:
         document = _new_document()
@@ -159,21 +169,21 @@ class LayerIntentTokenTest(unittest.TestCase):
             with self.subTest(layer=name):
                 self.assertEqual("cut", layer_intent(name))
 
-    def test_the_python_and_js_classifiers_agree(self) -> None:
-        # Two hand-copied tables with a comment saying they mirror each other, and nothing
-        # pinning them: validation would accept a drawing the viewer then renders as cut paths.
-        source = (
-            REPO_ROOT / "packages" / "cadgen-js" / "src" / "lib" / "dxf" / "parseDxf.js"
-        ).read_text(encoding="utf-8")
-        block = re.search(r"LAYER_INTENT_BY_TOKEN = new Map\(\[(.*?)\]\);", source, re.DOTALL)
-        self.assertIsNotNone(block, "cadgen-js must declare LAYER_INTENT_BY_TOKEN")
-        js_pairs = dict(re.findall(r'\["([a-z0-9]+)",\s*"([a-z]+)"\]', block.group(1)))
-        self.assertEqual(
-            drawing_checks._LAYER_INTENT_BY_TOKEN,
-            js_pairs,
-            "cadgen and cadgen-js disagree on layer intent; validation and rendering would classify "
-            "the same drawing differently",
+    def test_layer_intent_is_decided_in_exactly_one_place(self) -> None:
+        # There used to be a second table, in JavaScript, because the viewer parsed
+        # DXF itself; the two were hand-copied and nothing pinned them, so validation
+        # could accept a drawing the viewer then rendered as cut paths. Drawing is
+        # flattening now (cadgen.drawing_payload), which reads no layer NAMES at all,
+        # so this classifier is the only one — and must stay the only one.
+        strays = sorted(
+            path.relative_to(REPO_ROOT).as_posix()
+            for path in (REPO_ROOT / "packages").rglob("*.js")
+            if "node_modules" not in path.parts
+            and "dist" not in path.parts
+            and "_runtime" not in path.parts
+            and "LAYER_INTENT_BY_TOKEN" in path.read_text(encoding="utf-8", errors="ignore")
         )
+        self.assertEqual([], strays, f"a second layer-intent table reappeared in {strays}")
 def _drawing_with_dimensions():
     """The reporter's shape: open views, annotation layers with local names, dimensions."""
     document = ezdxf.new("R2010", setup=True)

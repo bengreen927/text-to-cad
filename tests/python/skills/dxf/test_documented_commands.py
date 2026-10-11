@@ -270,34 +270,31 @@ class DocumentedCommandForms(_DrawingHarness):
             self.DRAWING.replace("def gasket", "def panel"), encoding="utf-8"
         )
 
-    def test_a_bare_run_writes_the_sibling(self) -> None:
+    def test_the_documented_run_sequence(self) -> None:
+        # The sequence a reader types: a bare run writes the sibling, an unchanged
+        # source is a no-op, --force rebuilds to identical bytes.
         self.run_drawing("gasket.py")
-        self.assertTrue((self.project / "gasket.dxf").is_file())
-
-    def test_an_unchanged_source_is_a_no_op(self) -> None:
+        written = self.project / "gasket.dxf"
+        self.assertTrue(written.is_file())
+        before = written.stat().st_mtime_ns
+        first = written.read_bytes()
         self.run_drawing("gasket.py")
-        before = (self.project / "gasket.dxf").stat().st_mtime_ns
-        self.run_drawing("gasket.py")
-        self.assertEqual(before, (self.project / "gasket.dxf").stat().st_mtime_ns)
-
-    def test_force_rebuilds_to_identical_bytes(self) -> None:
-        self.run_drawing("gasket.py")
-        first = (self.project / "gasket.dxf").read_bytes()
+        self.assertEqual(before, written.stat().st_mtime_ns, "an unchanged source must be a no-op")
         self.run_drawing("gasket.py", "--force")
-        self.assertEqual(first, (self.project / "gasket.dxf").read_bytes())
+        self.assertEqual(first, written.read_bytes(), "--force must rebuild to identical bytes")
 
 
     def test_there_is_no_dxf_build_door(self) -> None:
         """A drawing has no derived state a door must materialize — the viewer
         parses the file directly and snapshot meshes it on demand — so `dxf
-        build` is simply not a command, and the dispatcher says so with the
-        command list."""
+        build` is simply not a command, and the dispatcher says so by naming the
+        verbs `dxf` does have (the noun is right; only the verb is unknown)."""
         completed = subprocess.run(
             [sys.executable, "-m", "cadgen.cli", "dxf", "build", "gasket.py"],
             cwd=str(self.project), env=self.environment, capture_output=True, text=True, timeout=600,
         )
         self.assertEqual(2, completed.returncode)
-        self.assertIn("unknown command", completed.stderr)
+        self.assertIn("unknown dxf command 'build'", completed.stderr)
         self.assertIn("dxf snapshot", completed.stderr)
 
     def test_no_undocumented_or_missing_flags(self) -> None:
@@ -395,7 +392,7 @@ class DocumentationTeachesTheNewContract(unittest.TestCase):
         free to drift back into teaching what to KNOW instead of what to do.
         """
         text = SKILL.read_text(encoding="utf-8")
-        snapshot_section = text[text.index("cadgen dxf snapshot` renders") :]
+        snapshot_section = text[text.index("cadgen dxf snapshot` draws a drawing flat") :]
         self.assertIn("written exactly as given", snapshot_section)
         self.assertIn("current working directory", snapshot_section)
         self.assertIn("missing file", snapshot_section)

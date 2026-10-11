@@ -16,6 +16,7 @@ from __future__ import annotations
 import io
 import json
 import unittest
+from unittest import mock
 from dataclasses import fields
 from pathlib import Path
 
@@ -145,6 +146,19 @@ class ResultShape(unittest.TestCase):
         self.assertEqual(result.files, ())
         self.assertEqual(result.parts[0]["ref"], "#o1.1")
 
+    def test_debug_without_json_prints_one_line_per_input_after_the_saved_paths(self) -> None:
+        # `--debug` alone used to compute the diagnostics and print nothing.
+        result = SnapshotResult(
+            ok=True, files=(SnapshotFile(path=Path("/tmp/a.png"), kind="png"),), warnings=("low light",),
+            debug=({"input": "part.step", "stageTimings": {"renderMs": 12}},),
+        )
+        self.assertEqual(result.human_lines(), [
+            # The platform's own spelling of the path: backslashes on Windows.
+            f"saved snapshot: {Path('/tmp/a.png')}",
+            "warning: low light",
+            'debug: {"input":"part.step","stageTimings":{"renderMs":12}}',
+        ])
+
     def test_an_empty_inventory_still_prints_itself(self) -> None:
         # List mode with zero parts answers `[]`, not silence.
         listing = {"ok": True, "mode": "list", "parts": []}
@@ -168,6 +182,12 @@ class JsonShape(unittest.TestCase):
                     "view": "ISO",
                     "input": "",
                     "tree": "",
+                    # A still is a video of nothing: `--video` fills these and a
+                    # PNG leaves them at zero. They are on the FILE because that
+                    # is what they describe.
+                    "frames": 0,
+                    "fps": 0,
+                    "seconds": 0.0,
                 }
             ],
         )
@@ -249,6 +269,62 @@ class JsonShape(unittest.TestCase):
         self.assertEqual(code, 1)
 
 
+class BrowserDiagnostics(unittest.IsolatedAsyncioTestCase):
+    async def render_packet(self, jobs, results, *, single=True):
+        from cadgen.snapshot_core import render_resolved_job_packet
+
+        renderer = mock.Mock(render=mock.AsyncMock(side_effect=results), close=mock.AsyncMock())
+        packet = {"single": single, "jobs": jobs}
+        rendered = await render_resolved_job_packet(packet, runtime_dir=Path("."), renderer=renderer)
+        renderer.close.assert_awaited_once()
+        return result_payload(snapshot_result(rendered, packet=packet))
+
+    async def test_browser_stages_survive_single_job_typed_json_with_resolution_and_input(self):
+        stages = {
+            "loadSourceMs": 10.5, "preparePoseMs": 0, "buildModelMs": 12,
+            "prepareViewportMs": 9, "waitViewportMs": 3, "captureMs": 60,
+            "sourceLoad": {"probeMs": 2, "cacheReadMs": 6.5, "cacheHitCount": 513, "cacheMissCount": 0},
+            "outputs": [{"path": "/tmp/review.png", "updateModelMs": 4,
+                         "frameCameraMs": 30, "drawSubmitMs": 5, "encodeImageMs": 18}],
+        }
+        job = {"input": "assembly.step", "debug": True, "outputs": [],
+               "resolved": {"debug": {"stepArtifact": {"cache": "hit"}}}}
+        payload = await self.render_packet([job], [{**VIEW_RESULT, "stageTimings": stages}])
+        self.assertEqual(payload["debug"], [{"input": "assembly.step",
+                         "stepArtifact": {"cache": "hit"}, "stageTimings": stages}])
+        self.assertNotIn("dataUrl", json.dumps(payload))
+        stages["outputs"][0]["encodeImageMs"] = 999
+        self.assertEqual(payload["debug"][0]["stageTimings"]["outputs"][0]["encodeImageMs"], 18)
+
+    async def test_mixed_packet_reports_only_requested_diagnostics_and_measured_stages(self):
+        jobs = [{"input": "first.step", "debug": True, "outputs": []},
+                {"input": "second.step", "debug": False, "outputs": []}]
+        raw = {**VIEW_RESULT, "stageTimings": {"loadSourceMs": 3}}
+        payload = await self.render_packet(jobs, [raw, raw], single=False)
+        self.assertEqual(payload["debug"], [{"input": "first.step", "stageTimings": {"loadSourceMs": 3}}])
+
+    async def test_invalid_and_unavailable_timings_do_not_create_diagnostic_placeholders(self):
+        values = [None, [], {}, {"sourceLoad": {"cacheHitCount": True, "componentCount": -1,
+                  "cacheMissCount": 1.2, "cacheBatchCount": 1 << 2000, "cacheReadMs": float("nan")}}, {"outputs": [{"path": "only-a-path"}]},
+                  {"loadSourceMs": True, "captureMs": -1, "buildModelMs": "3",
+                   "waitViewportMs": float("inf"), "prepareViewportMs": float("nan"),
+                   "preparePoseMs": 1 << 2000},
+                  {"dataUrl": "secret image bytes", "outputs": [False, {"drawSubmitMs": -2}]}]
+        for stages in values:
+            with self.subTest(stages=stages):
+                payload = await self.render_packet(
+                    [{"input": "part.step", "debug": True, "outputs": [], "resolved": {"debug": {}}}],
+                    [{**VIEW_RESULT, "stageTimings": stages}],
+                )
+                self.assertEqual(payload["debug"], [])
+        payload = await self.render_packet(
+            [{"input": "part.step", "debug": True, "outputs": [],
+              "resolved": {"debug": {"stepArtifact": {"cache": "hit"}}}}],
+            [{"ok": True, "mode": "list", "parts": []}],
+        )
+        self.assertEqual(payload["debug"], [{"input": "part.step", "stepArtifact": {"cache": "hit"}}])
+
+
 class PublicVerbs(unittest.TestCase):
     """Every snapshot door has a FUNCTION as well as a command."""
 
@@ -268,9 +344,9 @@ class PublicVerbs(unittest.TestCase):
 
         The doors used to share ONE signature and refuse the options a format
         cannot act on at runtime — so `cadgen stl snapshot --help` advertised
-        `--display`, `--kinematics`, `--focus` and `--hide` to a reader holding
-        a mesh, and every one of them errored. The signature is the surface
-        now, so what a door cannot do is simply absent from it.
+        `--kinematics`, `--focus` and `--hide` to a reader holding a mesh, and
+        every one of them errored. Camera and the unified format-neutral Display
+        object are intentionally shared by every door.
         """
         import importlib
         import inspect as inspect_module
@@ -287,17 +363,29 @@ class PublicVerbs(unittest.TestCase):
         )
         self.assertNotIn("joint_values", step, "a STEP model has no joints to pose")
 
-        for door in ("stl", "threemf", "glb", "dxf"):
+        for door in ("stl", "threemf", "glb"):
             with self.subTest(door=door):
                 mesh = parameters(f"cadgen.{door}")
-                for absent in ("display", "kinematics", "focus", "hide", "joint_values"):
+                self.assertLessEqual({"camera", "display"}, mesh)
+                self.assertNotIn("render", mesh)
+                for absent in ("kinematics", "focus", "hide", "joint_values"):
                     self.assertNotIn(absent, mesh, f"{absent} has nothing to act on here")
+
+        # The drawing door is the narrowest of the four shapes: a DXF is drawn
+        # flat, so there is no scene to stage and nothing to pose or frame.
+        drawing = parameters("cadgen.dxf")
+        self.assertIn("appearance", drawing)
+        for absent in ("camera", "display", "mode", "view_labels",
+                       "kinematics", "focus", "hide", "joint_values", "section"):
+            self.assertNotIn(absent, drawing, f"{absent} describes a scene a drawing does not have")
 
         for door in ("urdf", "sdf"):
             with self.subTest(door=door):
                 robot = parameters(f"cadgen.{door}")
                 self.assertIn("joint_values", robot)
-                for absent in ("display", "kinematics", "focus", "hide"):
+                self.assertLessEqual({"camera", "display"}, robot)
+                self.assertNotIn("render", robot)
+                for absent in ("kinematics", "focus", "hide"):
                     self.assertNotIn(absent, robot, f"{absent} requires STEP topology")
 
         # The polymorphic door routes by suffix, so it is the UNION: a job
@@ -320,7 +408,14 @@ class PublicVerbs(unittest.TestCase):
             return set(inspect_module.signature(verb).parameters)
 
         self.assertEqual(parameters("urdf") - {"joint_values"}, parameters("stl"))
-        self.assertEqual(parameters("stl"), parameters("dxf"))
+        # A drawing is deliberately NOT one of them: it shares the whole of what
+        # is left after the scene goes (where, how big, and which appearance),
+        # and adds nothing the mesh shape does not also mean.
+        self.assertLessEqual(
+            parameters("dxf") - {"appearance"},
+            parameters("stl"),
+            "the drawing door invented a spelling the mesh door does not have",
+        )
 
 
     def test_a_verb_with_no_target_says_so_rather_than_reading_stdin(self) -> None:

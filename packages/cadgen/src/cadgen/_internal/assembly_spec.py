@@ -8,11 +8,7 @@ and ``generation`` import.
 
 from __future__ import annotations
 
-from pathlib import Path
 
-
-
-STEP_SUFFIXES = (".step", ".stp")
 
 IDENTITY_TRANSFORM: tuple[float, ...] = (
     1.0, 0.0, 0.0, 0.0,

@@ -109,12 +109,14 @@ with the actual image paths and outputs. Each reviewer must inspect the images
 and distinguish visible evidence from inference. Correct the shared table first,
 then rebuild affected drawings and models.
 
-Then verify the documents. Run `refs --facts --planes --positioning` and
-`validate` on each STEP. For an assembly, run `interfere` on the intended part
-scope and each required static state. Confirm `ok`, `complete`, `conclusive`,
-`errors`, and pair statistics; no visible clash is not proof that hidden parts
-clear one another. Add targeted measurements for bores, fasteners, mating
-interfaces, and motion envelopes.
+Then verify the documents with Python checks (see
+[inspection and validation](inspection-and-validation.md)). Open each STEP with
+`read_scene`; check bounds, solid count, and soundness with `topology_errors`
+and per-solid volume. For an assembly, measure `overlap_volume` for every
+intended part pair at each required static state, and confirm the tested-pair
+count; no visible clash is not proof that hidden parts clear one another. Add
+targeted measurements for bores, fasteners, mating interfaces, and motion
+envelopes.
 
 When no reliable scale exists or perspective dominates, ask for one concrete
 measurement: the largest, flattest functionally important part. Continue other

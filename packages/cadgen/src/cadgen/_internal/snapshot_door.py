@@ -8,13 +8,16 @@ the loaders the verb already uses; library-side a real dict through the same
 parameter — so the signature IS the surface and ``cli_from_function`` derives
 the CLI exactly as it does for ``build`` and ``validate``.
 
-Three signature shapes cover the seven doors honestly (the old shared
+Four signature shapes cover the seven doors honestly (the old shared
 signature advertised STEP-only options to every door and refused them at
 runtime):
 
-- STEP: the full surface — section mode, display, kinematics, animation, focus/hide.
-- mesh (stl/3mf/glb) and dxf: view/list renders of untyped geometry.
+- STEP: the full surface — section mode and its plane, display, kinematics, animation, focus/hide.
+- mesh (stl/3mf/glb): view/list renders of untyped geometry.
 - robot (urdf/sdf): the mesh shape plus ``joint_values``.
+- dxf: a DRAWING, not a scene. Where, how big, and light or dark — nothing
+  else, because a flat 2D drawing has no camera to pose, no surfaces to
+  shade and no parts to list.
 
 The polymorphic ``cadgen snapshot`` binds the UNION shape (STEP surface +
 ``joint_values``) over every kind at once: a job packet may mix formats, and
@@ -27,6 +30,8 @@ before its freshness gate runs, and this module rides along.
 
 from __future__ import annotations
 
+import contextvars
+import functools
 from pathlib import Path
 
 from cadgen.results import SnapshotResult
@@ -50,6 +55,27 @@ ALL_KINDS: tuple[str, ...] = tuple(
 )
 
 
+# Direct calls need the same omitted-versus-explicit distinction the generated
+# CLI preserves. The wrapper retains the public function's inspectable
+# signature through ``functools.wraps``; ContextVar keeps concurrent calls
+# independent.
+_EXPLICIT_SNAPSHOT_OPTIONS: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
+    "cadgen_explicit_snapshot_options", default=frozenset()
+)
+
+
+def _track_explicit_options(function):
+    @functools.wraps(function)
+    def tracked(*args, **kwargs):
+        token = _EXPLICIT_SNAPSHOT_OPTIONS.set(frozenset(kwargs))
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _EXPLICIT_SNAPSHOT_OPTIONS.reset(token)
+
+    return tracked
+
+
 def _run(
     door_kinds: tuple[str, ...],
     *,
@@ -58,11 +84,12 @@ def _run(
     job: Path | None,
     mode: str,
     camera: object,
-    theme: object,
     display: object = None,
     kinematics: object = None,
     animation: object = None,
     time: float | None = None,
+    video: object = None,
+    section: object = None,
     joint_values: object = None,
     focus: tuple[str, ...] = (),
     hide: tuple[str, ...] = (),
@@ -75,8 +102,6 @@ def _run(
     # Imported here rather than at module scope: `cadgen.step` is on a model
     # script's pre-gate path, and the snapshot machinery drags in the catalog,
     # selector lookup and STEP targets.
-    import io
-
     from cadgen.snapshot_cli import SnapshotOptions, run_snapshot
 
     options = SnapshotOptions(
@@ -90,12 +115,11 @@ def _run(
         view_labels=view_labels,
         debug=debug,
     )
-    # `None` is "not given" for each of these, which is not the same as the
-    # default: the machinery distinguishes them through the `<name>_specified`
-    # flags, and a theme passed as its own default value must still count as
-    # a choice (it changes the size profile).
-    if theme is not None:
-        options.theme, options.theme_specified = theme, True
+    options.mode_specified = "mode" in _EXPLICIT_SNAPSHOT_OPTIONS.get()
+    # `None` is every optional's documented default, so passing it explicitly is
+    # the same as leaving it out: `snapshot(display=None)` renders the default
+    # display. The generated CLI never passes one (an absent flag is an absent
+    # keyword), so this is the library caller's rule.
     if display is not None:
         options.display, options.display_specified = display, True
     if camera is not None:
@@ -106,37 +130,67 @@ def _run(
     # clip — and means nothing without the clip it indexes.
     if time is not None and animation is None:
         raise ValueError("time requires animation: name the clip the frame is taken from")
+    # `video` is the other half of the same request: the SPAN of the clip rather
+    # than one moment of it. It needs the clip for the same reason `time` does,
+    # and it cannot be combined with `time` — one frame or a sequence, never
+    # both, and silently honouring one of them would answer the wrong question.
+    if video is not None and animation is None:
+        raise ValueError("video requires animation: name the clip the sequence renders")
+    if video is not None and time is not None:
+        raise ValueError(
+            "video and time cannot be used together: time freezes one frame, video renders "
+            "the span — use video start/seconds to say where the sequence begins"
+        )
     if animation is not None:
         options.animation, options.animation_time, options.animation_specified = animation, time, True
+    if video is not None:
+        options.video, options.video_specified = video, True
+    if section is not None:
+        options.section, options.section_specified = section, True
     if joint_values is not None:
         options.joint_values, options.joint_values_specified = joint_values, True
-    if focus:
-        options.focus = [str(value) for value in focus]
-    if hide:
-        options.hide = [str(value) for value in hide]
-    if options.focus and options.hide:
+    options.focus = _refs(focus, "focus")
+    options.hide = _refs(hide, "hide")
+    options.focus_specified, options.hide_specified = bool(options.focus), bool(options.hide)
+    if options.focus and options.hide and job is None:
         raise ValueError("focus and hide cannot be used in the same snapshot")
-    # An empty non-tty stream: the machinery reads a JSON packet off stdin when
-    # given neither job nor target, and a library caller has no stdin to offer.
-    return run_snapshot(options, kinds=door_kinds, stdin=io.StringIO())
+    return run_snapshot(options, kinds=door_kinds)
+
+
+def _refs(value: object, name: str) -> list[str] | None:
+    """``focus``/``hide`` as a list of refs: a sequence of strings, never one string.
+
+    ``focus="#o1.2"`` is the natural slip from the CLI's repeatable flag, and a
+    string IS a sequence — of characters, each of which used to be looked up as
+    a ref of its own.
+    """
+    if isinstance(value, (str, bytes)):
+        raise ValueError(
+            f"{name} takes a sequence of occurrence refs, not one string: "
+            f"pass {name}=({value!r},)"
+        )
+    refs = [str(ref) for ref in (value or ())]
+    return refs or None
 
 
 def step_snapshot_verb(door: str):
     """The STEP-shaped ``snapshot`` verb: the full surface."""
     kinds = DOOR_KINDS[door]
 
+    @_track_explicit_options
     def snapshot(
         target: Path | None = None,
         out: Path | None = None,
         *,
         job: Path | None = None,
         mode: str = "view",
+        section: str | dict | None = None,
         camera: str | dict | None = None,
-        theme: str | dict | None = None,
         display: str | dict | None = None,
         kinematics: str | dict | None = None,
         animation: str | dict | None = None,
         time: float | None = None,
+        video: str | dict | None = None,
         focus: tuple[str, ...] = (),
         hide: tuple[str, ...] = (),
         width: int | None = None,
@@ -147,45 +201,65 @@ def step_snapshot_verb(door: str):
     ) -> SnapshotResult:
         """Render TARGET and report the files written.
 
-        An explicit OUT is written exactly there and is cleared first, so a
-        failed render leaves no file at all; a directory gets a generated
-        timestamped name inside it. Rendering is a read: nothing about the
-        model changes, though a STEP input whose tree is missing
+        An explicit OUT is written exactly there. A refused request leaves an
+        existing OUT untouched; once the request is accepted OUT is cleared, so
+        a failed build or render leaves no file at all. A directory gets a
+        generated timestamped name inside it. Rendering is a read: nothing
+        about the model changes, though a STEP input whose tree is missing
         builds one.
 
         target: the model to render — a .step/.stp document (a model script
             is refused by naming the run that writes the document).
-        out: destination image path (written EXACTLY there, cleared first),
-            or a directory for a generated timestamped name.
+        out: destination path, written EXACTLY there — .png (section mode
+            also writes .svg, --video writes .mp4/.gif) — or a directory for
+            a generated timestamped name.
         job: a render-job JSON file — one job, an array of them, or
             {"jobs": [...]}. When given it wins: target/out are ignored, and
-            a missing job file raises FileNotFoundError.
+            the other flags override every job in it.
         mode: view (default), section, or list.
-        camera: a preset, an "azimuth:elevation" pair, or camera JSON.
-        theme: a saved theme id, theme-settings JSON, or a theme file path.
-        display: a display mode name, display-settings JSON, or a file path.
+        section: where --mode section cuts, as PLANE[:OFFSET] — the plane is
+            XY, XZ or YZ (default XY) and the offset moves it along its normal
+            in model units (default 0): XZ:12.5 cuts at Y=12.5. In a job,
+            {"plane": "XZ", "offset": 12.5}.
+        camera: a preset (front, back, left, right, top, bottom, iso), an
+            "azimuth:elevation" pair, or camera JSON;
+            orthographicHalfHeight preserves an orthographic view's scale.
+            Projection and focalLength (20..200 mm) belong in display.camera.
+        display: a preset name, grouped display JSON, or JSON file path. Presets
+            are solid (default), render, xray, hidden-line, wireframe and grid.
+            Omitted groups inherit the preset; group objects imply enabled unless
+            explicitly false. appearance is light (default) or dark.
         kinematics: pose values — a declared preset name or {dof: value}
-            JSON, validated against the model's kinematics declaration.
-        animation: one still frame of a clip the document's render module
-            (<name>.step.js beside it) declares — the clip name (with --time),
-            or {"clip": name, "time": seconds} JSON; layered over the
-            kinematics pose the way the viewer does.
+            JSON, validated against the model's kinematics declaration;
+            available in every display mode.
+        animation: one still frame of a clip embedded in the document sidecar —
+            the clip name (with --time),
+            or {"clip": name, "time": seconds} JSON. It is layered over the
+            kinematics pose.
         time: seconds into the animation clip (default 0); requires animation.
-        focus: occurrence ref rendered at full opacity (repeatable); the
-            rest of the assembly is ghosted in place.
-        hide: occurrence ref left out of the render (repeatable).
-        width: output width in pixels, overriding the size profile.
-        height: output height in pixels, overriding the size profile.
-        size_profile: simple, diagnostic, labeled, assembly, presentation,
-            or contact-sheet.
+        video: render the clip as a VIDEO instead of one frame, into the .mp4 or
+            .gif OUT names — {"fps": 30, "seconds": <what is left of the clip>,
+            "start": 0, "quality": "review", "loop": true} JSON or a path to it;
+            requires animation, excludes time, and needs ffmpeg on PATH.
+        focus: occurrence ref rendered at full opacity (repeatable); the rest
+            of the assembly is ghosted in place.
+        hide: occurrence ref left out (repeatable).
+        width: output width in pixels (1..8192), overriding the size profile;
+            with --job it sizes every output in the packet.
+        height: output height in pixels (1..8192), overriding the size profile.
+        size_profile: simple (1200x900), simple-square (1024x1024), diagnostic
+            (1600x1200, the default), labeled (1600x1200), assembly (1800x1200),
+            assembly-large (1920x1440), presentation (2400x1600),
+            presentation-large (2800x1800), or contact-sheet (2400x1600).
         view_labels: burn the camera/view label into the image.
-        debug: report how each input's artifact resolved.
+        debug: report artifact resolution and measured browser stages in the
+            result's debug field (read it with --json).
         """
         return _run(
             kinds,
             target=target, out=out, job=job, mode=mode,
-            camera=camera, theme=theme, display=display, kinematics=kinematics,
-            animation=animation, time=time,
+            camera=camera, display=display, kinematics=kinematics,
+            animation=animation, time=time, video=video, section=section,
             focus=focus, hide=hide, width=width, height=height,
             size_profile=size_profile, view_labels=view_labels, debug=debug,
         )
@@ -193,12 +267,174 @@ def step_snapshot_verb(door: str):
     return snapshot
 
 
-def mesh_snapshot_verb(door: str):
-    """The mesh/dxf-shaped verb: view/list renders of untyped geometry —
-    no display, kinematics, section mode, or selection (nothing to act on)."""
+# --- what a drawing is not ---------------------------------------------------
+# The sentences BOTH refusal paths say. A `.dxf` reaches a refusal two ways: a
+# flag this door used to take (`--camera`, refused while parsing, below) and a
+# key in a job packet (`"camera"`, refused by
+# `cadgen.snapshot_cli.check_drawing_render_job`, which `cadgen snapshot` routes
+# a `.dxf` through too). They are one cutover and must read as one, so the
+# wording lives here -- beside the signature whose absences it explains -- and
+# both paths compose it. Stdlib-only strings: this module stays off the CAD
+# stack, and `--help` with it.
+
+# What a drawing IS, said once: every refusal opens with it.
+DRAWING_IS = "a DXF is drawn as a flat 2D drawing, fitted to the image and painted head on"
+# What `display` describes, and a drawing therefore has none of.
+DRAWING_SCENE = "a 3D scene — a render mode, surfaces, lighting, a floor"
+# The one display key that survives, and where to pass it on either surface.
+DRAWING_APPEARANCE_HINT = (
+    "Light or dark is the whole of a drawing's appearance: pass "
+    '--appearance light|dark (in a job, "display": {"appearance": "dark"}).'
+)
+# Why a view LABEL has nothing to say about a drawing.
+DRAWING_NO_VIEW_NAME = (
+    "a drawing has no camera, so there is no view name to burn into the image"
+)
+
+
+def drawing_camera_refusal(subject: str) -> str:
+    """Why ``camera`` is refused -- ``subject`` is the file, or ``a drawing``."""
+    return (
+        f"camera poses a model in space; {DRAWING_IS}, so {subject} has no camera and no "
+        "views to choose between — it is always shown whole, the way it was drawn."
+    )
+
+
+def drawing_mode_refusal(subject: str) -> str:
+    """Why ``view`` is the only render mode a drawing has."""
+    return (
+        f"{DRAWING_IS}: it has no parts to list and no solid to section, so view is the "
+        f"only mode {subject} renders in."
+    )
+
+
+def drawing_scene_refusal(named: str, subject: str, *, plural: bool) -> str:
+    """Why display settings are refused -- ``named`` is the flag or the job keys."""
+    return (
+        f"{named} {'describe' if plural else 'describes'} {DRAWING_SCENE}; {DRAWING_IS}, "
+        f"so {subject} has none of them. {DRAWING_APPEARANCE_HINT}"
+    )
+
+
+# The flags this door took while a DXF was rendered as a 3D flat pattern. They
+# are gone from the signature above, so each one is declared here with what it
+# meant, why a drawing has no such thing, and what to do instead; the command
+# name and the flag are supplied by the parser
+# (`cadgen._internal.cli_from_function.retired_options`).
+DRAWING_RETIRED_OPTIONS: dict[str, str] = {
+    "--camera": (
+        f"{drawing_camera_refusal('a drawing')} Drop the flag; there is no view to ask for."
+    ),
+    "--display": drawing_scene_refusal("display", "a drawing", plural=False),
+    "--mode": (
+        f"mode chose between view, section and list; {drawing_mode_refusal('a drawing')} "
+        "Drop the flag."
+    ),
+    "--view-labels": (
+        f"view labels burnt the camera's view name into the image; {DRAWING_IS} — "
+        f"{DRAWING_NO_VIEW_NAME}. Drop the flag."
+    ),
+}
+
+
+def drawing_snapshot_verb(door: str):
+    """The DRAWING-shaped verb: a flat 2D render of a ``.dxf``.
+
+    The narrowest door of the seven, and deliberately so. A DXF is drawn
+    exactly as the CAD Viewer's DXF pane draws it — the whole drawing, fitted
+    to the image, in the pens the file declares on the theme's background — so
+    every option that describes a 3D scene is absent from this signature
+    rather than accepted and ignored: no ``camera`` (nothing to pose), no
+    ``display`` (no surfaces, lighting or render mode), no ``mode`` (a drawing
+    has no parts to list and no solid to section), no ``view_labels`` (no view
+    to label). ``appearance`` is what survives of display, because a default
+    pen has no colour until a background is chosen.
+
+    Absent is not silent: each of those four is declared in
+    :data:`DRAWING_RETIRED_OPTIONS` and refused by name, in the same words the
+    job-packet check uses for the same request.
+    """
     kinds = DOOR_KINDS[door]
     suffixes = ", ".join(f".{kind}" for kind in kinds)
 
+    @_track_explicit_options
+    def snapshot(
+        target: Path | None = None,
+        out: Path | None = None,
+        *,
+        job: Path | None = None,
+        appearance: str = "light",
+        width: int | None = None,
+        height: int | None = None,
+        size_profile: str = "",
+        debug: bool = False,
+    ) -> SnapshotResult:
+        """Render TARGET as a flat 2D drawing and report the files written.
+
+        The whole drawing is fitted to the image, head on, in the pens the
+        file declares; an entity with no pen of its own (ACI 7) takes the
+        appearance's foreground. An explicit OUT is written exactly there. A
+        refused request leaves an existing OUT untouched; once the request is
+        accepted OUT is cleared, so a failed render leaves no file at all. A
+        directory gets a generated timestamped name inside it.
+
+        target: the drawing to render. It accepts: {suffixes}.
+        out: destination .png path, written EXACTLY there, or a directory
+            for a generated timestamped name.
+        job: a render-job JSON file — one job, an array of them, or
+            {"jobs": [...]}. When given it wins: target/out are ignored, and
+            the other flags override every job in it.
+        appearance: light (default) or dark — the background the drawing is
+            painted on, and therefore the colour of its default pen.
+        width: output width in pixels (1..8192), overriding the size profile;
+            with --job it sizes every output in the packet.
+        height: output height in pixels (1..8192), overriding the size profile.
+        size_profile: simple (1200x900), simple-square (1024x1024), diagnostic
+            (1600x1200, the default), labeled (1600x1200), assembly (1800x1200),
+            assembly-large (1920x1440), presentation (2400x1600),
+            presentation-large (2800x1800), or contact-sheet (2400x1600).
+        debug: report artifact resolution and measured browser stages in the
+            result's debug field (read it with --json).
+        """
+        # The same closed set every other door's `display.appearance` takes,
+        # read from where it is declared rather than spelled again here.
+        from cadgen.snapshot_core import DISPLAY_APPEARANCES
+
+        if appearance not in DISPLAY_APPEARANCES:
+            raise ValueError(
+                f"appearance is {' or '.join(sorted(DISPLAY_APPEARANCES))}; got {appearance!r}"
+            )
+        return _run(
+            kinds,
+            target=target, out=out, job=job, mode="view",
+            camera=None,
+            # `appearance` IS display, for a drawing: the one display key that
+            # survives. Passing it only when it was asked for keeps a `--job`
+            # file's own appearance from being overwritten by this default.
+            display=(
+                {"appearance": appearance}
+                if "appearance" in _EXPLICIT_SNAPSHOT_OPTIONS.get()
+                else None
+            ),
+            width=width, height=height, size_profile=size_profile,
+            view_labels=False, debug=debug,
+        )
+
+    snapshot.__doc__ = snapshot.__doc__.replace("{suffixes}", suffixes)
+    # The four flags the 3D flat pattern took. Absent from the signature, and
+    # therefore from `--help`, but still REFUSED BY NAME rather than reported
+    # as noise: the parser keeps them as hidden entries that only ever raise.
+    snapshot.__cadgen_retired_options__ = dict(DRAWING_RETIRED_OPTIONS)
+    return snapshot
+
+
+def mesh_snapshot_verb(door: str):
+    """The mesh-shaped verb: view/list renders of untyped geometry —
+    no kinematics, section mode, or selection (nothing to act on)."""
+    kinds = DOOR_KINDS[door]
+    suffixes = ", ".join(f".{kind}" for kind in kinds)
+
+    @_track_explicit_options
     def snapshot(
         target: Path | None = None,
         out: Path | None = None,
@@ -206,7 +442,7 @@ def mesh_snapshot_verb(door: str):
         job: Path | None = None,
         mode: str = "view",
         camera: str | dict | None = None,
-        theme: str | dict | None = None,
+        display: str | dict | None = None,
         width: int | None = None,
         height: int | None = None,
         size_profile: str = "",
@@ -215,29 +451,42 @@ def mesh_snapshot_verb(door: str):
     ) -> SnapshotResult:
         """Render TARGET and report the files written.
 
-        An explicit OUT is written exactly there and is cleared first, so a
-        failed render leaves no file at all; a directory gets a generated
+        An explicit OUT is written exactly there. A refused request leaves an
+        existing OUT untouched; once the request is accepted OUT is cleared, so
+        a failed render leaves no file at all. A directory gets a generated
         timestamped name inside it.
 
         target: the file to render. It accepts: {suffixes}.
-        out: destination image path (written EXACTLY there, cleared first),
-            or a directory for a generated timestamped name.
+        out: destination .png path, written EXACTLY there, or a directory
+            for a generated timestamped name.
         job: a render-job JSON file — one job, an array of them, or
-            {"jobs": [...]}. When given it wins: target/out are ignored.
+            {"jobs": [...]}. When given it wins: target/out are ignored, and
+            the other flags override every job in it.
         mode: view (default) or list.
-        camera: a preset, an "azimuth:elevation" pair, or camera JSON.
-        theme: a saved theme id, theme-settings JSON, or a theme file path.
-        width: output width in pixels, overriding the size profile.
-        height: output height in pixels, overriding the size profile.
-        size_profile: simple, diagnostic, labeled, assembly, presentation,
-            or contact-sheet.
+        camera: a preset (front, back, left, right, top, bottom, iso), an
+            "azimuth:elevation" pair, or camera JSON;
+            orthographicHalfHeight preserves an orthographic view's scale.
+            Projection and focalLength (20..200 mm) belong in display.camera.
+        display: solid (default) or render, grouped display JSON, or a JSON file
+            path. Omitted groups inherit the preset; appearance defaults to
+            light. Projection belongs in display.camera. edges, clip, exploded,
+            the xray, hidden-line and wireframe modes and the hidden/off surface
+            styles describe a STEP model and are refused here.
+        width: output width in pixels (1..8192), overriding the size profile;
+            with --job it sizes every output in the packet.
+        height: output height in pixels (1..8192), overriding the size profile.
+        size_profile: simple (1200x900), simple-square (1024x1024), diagnostic
+            (1600x1200, the default), labeled (1600x1200), assembly (1800x1200),
+            assembly-large (1920x1440), presentation (2400x1600),
+            presentation-large (2800x1800), or contact-sheet (2400x1600).
         view_labels: burn the camera/view label into the image.
-        debug: report how each input's artifact resolved.
+        debug: report artifact resolution and measured browser stages in the
+            result's debug field (read it with --json).
         """
         return _run(
             kinds,
             target=target, out=out, job=job, mode=mode,
-            camera=camera, theme=theme, width=width, height=height,
+            camera=camera, display=display, width=width, height=height,
             size_profile=size_profile, view_labels=view_labels, debug=debug,
         )
 
@@ -250,6 +499,7 @@ def robot_snapshot_verb(door: str):
     kinds = DOOR_KINDS[door]
     suffixes = ", ".join(f".{kind}" for kind in kinds)
 
+    @_track_explicit_options
     def snapshot(
         target: Path | None = None,
         out: Path | None = None,
@@ -258,7 +508,7 @@ def robot_snapshot_verb(door: str):
         mode: str = "view",
         joint_values: str | dict | None = None,
         camera: str | dict | None = None,
-        theme: str | dict | None = None,
+        display: str | dict | None = None,
         width: int | None = None,
         height: int | None = None,
         size_profile: str = "",
@@ -267,31 +517,45 @@ def robot_snapshot_verb(door: str):
     ) -> SnapshotResult:
         """Render TARGET and report the files written.
 
-        An explicit OUT is written exactly there and is cleared first, so a
-        failed render leaves no file at all; a directory gets a generated
+        An explicit OUT is written exactly there. A refused request leaves an
+        existing OUT untouched; once the request is accepted OUT is cleared, so
+        a failed render leaves no file at all. A directory gets a generated
         timestamped name inside it.
 
         target: the robot description to render. It accepts: {suffixes}.
-        out: destination image path (written EXACTLY there, cleared first),
-            or a directory for a generated timestamped name.
+        out: destination .png path, written EXACTLY there, or a directory
+            for a generated timestamped name.
         job: a render-job JSON file — one job, an array of them, or
-            {"jobs": [...]}. When given it wins: target/out are ignored.
+            {"jobs": [...]}. When given it wins: target/out are ignored, and
+            the other flags override every job in it.
         mode: view (default) or list.
         joint_values: {joint: degrees} JSON posing the robot; joints not
-            named stay at the rest pose.
-        camera: a preset, an "azimuth:elevation" pair, or camera JSON.
-        theme: a saved theme id, theme-settings JSON, or a theme file path.
-        width: output width in pixels, overriding the size profile.
-        height: output height in pixels, overriding the size profile.
-        size_profile: simple, diagnostic, labeled, assembly, presentation,
-            or contact-sheet.
+            named stay where the viewer opens it (each at its default, then
+            an SRDF's home group state).
+        camera: a preset (front, back, left, right, top, bottom, iso), an
+            "azimuth:elevation" pair, or camera JSON;
+            orthographicHalfHeight preserves an orthographic view's scale.
+            Projection and focalLength (20..200 mm) belong in display.camera.
+        display: solid (default) or render, grouped display JSON, or a JSON file
+            path. Omitted groups inherit the preset; appearance defaults to
+            light. Projection belongs in display.camera. edges, clip, exploded,
+            the xray, hidden-line and wireframe modes and the hidden/off surface
+            styles describe a STEP model and are refused here.
+        width: output width in pixels (1..8192), overriding the size profile;
+            with --job it sizes every output in the packet.
+        height: output height in pixels (1..8192), overriding the size profile.
+        size_profile: simple (1200x900), simple-square (1024x1024), diagnostic
+            (1600x1200, the default), labeled (1600x1200), assembly (1800x1200),
+            assembly-large (1920x1440), presentation (2400x1600),
+            presentation-large (2800x1800), or contact-sheet (2400x1600).
         view_labels: burn the camera/view label into the image.
-        debug: report how each input's artifact resolved.
+        debug: report artifact resolution and measured browser stages in the
+            result's debug field (read it with --json).
         """
         return _run(
             kinds,
             target=target, out=out, job=job, mode=mode,
-            joint_values=joint_values, camera=camera, theme=theme,
+            joint_values=joint_values, camera=camera, display=display,
             width=width, height=height, size_profile=size_profile,
             view_labels=view_labels, debug=debug,
         )
@@ -305,18 +569,20 @@ def polymorphic_snapshot_verb():
     and a job packet may mix formats — each input is still held to its own
     format's rules at resolve time."""
 
+    @_track_explicit_options
     def snapshot(
         target: Path | None = None,
         out: Path | None = None,
         *,
         job: Path | None = None,
         mode: str = "view",
+        section: str | dict | None = None,
         camera: str | dict | None = None,
-        theme: str | dict | None = None,
         display: str | dict | None = None,
         kinematics: str | dict | None = None,
         animation: str | dict | None = None,
         time: float | None = None,
+        video: str | dict | None = None,
         joint_values: str | dict | None = None,
         focus: tuple[str, ...] = (),
         hide: tuple[str, ...] = (),
@@ -328,40 +594,64 @@ def polymorphic_snapshot_verb():
     ) -> SnapshotResult:
         """Render any supported input, routed by suffix.
 
-        target: the file to render — STEP/STP, model script, STL/3MF/GLB,
-            DXF, or a robot description (URDF/SRDF/SDF).
-        out: destination image path (written EXACTLY there, cleared first),
-            or a directory for a generated timestamped name.
+        target: the document to render — STEP/STP, STL/3MF/GLB, DXF, or a
+            robot description (URDF/SRDF/SDF). Run model scripts first, then
+            snapshot the document they write.
+        out: destination path, written EXACTLY there — .png (a STEP section
+            also writes .svg, a STEP --video writes .mp4/.gif) — or a directory
+            for a generated timestamped name. A refused request leaves an
+            existing OUT untouched; an accepted one clears it first.
         job: a render-job JSON file — one job, an array of them, or
-            {"jobs": [...]}; jobs may mix formats. When given it wins.
-        mode: view (default), section (STEP only), or list.
-        camera: a preset, an "azimuth:elevation" pair, or camera JSON.
-        theme: a saved theme id, theme-settings JSON, or a theme file path.
-        display: display settings (STEP inputs only).
+            {"jobs": [...]}; jobs may mix formats. When given it wins, and the
+            other flags override every job in it.
+        mode: view (default), section (STEP only), or list (not DXF: a
+            drawing has no parts to list).
+        section: where a STEP --mode section cuts, as PLANE[:OFFSET] — XY, XZ
+            or YZ, offset along the plane's normal in model units: XZ:12.5.
+        camera: a preset (front, back, left, right, top, bottom, iso), an
+            "azimuth:elevation" pair, or camera JSON;
+            orthographicHalfHeight preserves an orthographic view's scale.
+            Projection and focalLength (20..200 mm) belong in display.camera.
+            A DXF is drawn flat and head on, and refuses a camera.
+        display: solid (default), render, xray, hidden-line, wireframe or grid, grouped
+            display JSON, or a JSON file path. appearance defaults to light.
+            Omitted groups inherit the preset. edges, clip, exploded, the xray,
+            hidden-line and wireframe modes and the hidden/off surface styles
+            describe a STEP model; every other input takes solid or render. A
+            DXF takes appearance alone (`cadgen dxf snapshot --appearance`).
         kinematics: pose values for a STEP model's kinematics — a preset
-            name or {dof: value} JSON.
+            name or {dof: value} JSON; available in every display mode.
         animation: one still frame of a STEP model's clip — the clip name
             (with --time), or {"clip": name, "time": seconds} JSON.
         time: seconds into the animation clip (default 0); requires animation.
-        joint_values: {joint: degrees} JSON posing a robot description.
-        focus: occurrence ref rendered at full opacity (STEP only).
-        hide: occurrence ref left out of the render (STEP only).
-        width: output width in pixels, overriding the size profile.
-        height: output height in pixels, overriding the size profile.
-        size_profile: simple, diagnostic, labeled, assembly, presentation,
-            or contact-sheet.
+        video: render a STEP model's clip as a VIDEO into a .mp4/.gif OUT —
+            {"fps": 30, "seconds": <what is left of the clip>, "start": 0,
+            "quality": "review", "loop": true} JSON or a path to it; requires
+            animation, excludes time, and needs ffmpeg on PATH.
+        joint_values: {joint: degrees} JSON posing a robot (URDF/SRDF/SDF
+            only); available in every display mode.
+        focus: occurrence ref rendered at full opacity (STEP only,
+            repeatable); the rest of the assembly is ghosted in place.
+        hide: occurrence ref left out (STEP only, repeatable).
+        width: output width in pixels (1..8192), overriding the size profile;
+            with --job it sizes every output in the packet.
+        height: output height in pixels (1..8192), overriding the size profile.
+        size_profile: simple (1200x900), simple-square (1024x1024), diagnostic
+            (1600x1200, the default), labeled (1600x1200), assembly (1800x1200),
+            assembly-large (1920x1440), presentation (2400x1600),
+            presentation-large (2800x1800), or contact-sheet (2400x1600).
         view_labels: burn the camera/view label into the image.
-        debug: report how each input's artifact resolved.
+        debug: report artifact resolution and measured browser stages in the
+            result's debug field (read it with --json).
         """
         return _run(
             ALL_KINDS,
             target=target, out=out, job=job, mode=mode,
-            camera=camera, theme=theme, display=display, kinematics=kinematics,
-            animation=animation, time=time,
+            camera=camera, display=display, kinematics=kinematics,
+            animation=animation, time=time, video=video, section=section,
             joint_values=joint_values, focus=focus, hide=hide,
             width=width, height=height, size_profile=size_profile,
             view_labels=view_labels, debug=debug,
         )
 
     return snapshot
-

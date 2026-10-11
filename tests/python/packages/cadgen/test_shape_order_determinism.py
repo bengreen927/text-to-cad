@@ -148,5 +148,54 @@ class ShapeDedupOrderTest(unittest.TestCase):
         self.assertEqual(order(1.0), order(2.0))
 
 
+class LiveVertexHashTest(unittest.TestCase):
+    """``Vertex.__hash__`` follows the live native point, rounded to 1e-6, while
+    equality stays build123d's own: pointer identity."""
+
+    def setUp(self) -> None:
+        from cadgen._internal import determinism
+
+        determinism.install()
+
+    def assert_same_bucket(self, first, second) -> None:
+        self.assertEqual(first, second)
+        self.assertEqual(hash(first), hash(second))
+        self.assertEqual(len({first, second}), 1)
+        self.assertEqual({first: "found"}[second], "found")
+
+    def test_pointer_distinct_vertices_share_a_bucket_but_stay_separate(self) -> None:
+        from build123d import Vertex
+
+        first, second = Vertex(1, 2, 3), Vertex(1, 2, 3)
+        self.assertNotEqual(first, second)
+        self.assertEqual(hash(first), hash(second))
+        self.assertEqual(len({first, second}), 2)
+        self.assert_same_bucket(first, Vertex(first.wrapped))
+        self.assertEqual(hash(Vertex(0.0000004, 0, 0)), hash(Vertex(0.00000045, 0, 0)))
+        self.assertNotEqual(hash(Vertex(0.0000004, 0, 0)), hash(Vertex(0.0000006, 0, 0)))
+
+    def test_native_point_edit_ignores_stale_python_coordinates(self) -> None:
+        from build123d import Vertex
+        from OCP.BRep import BRep_Builder
+        from OCP.gp import gp_Pnt
+
+        vertex = Vertex(1, 2, 3)
+        alias = Vertex(vertex.wrapped)
+        before = hash(vertex)
+        BRep_Builder().UpdateVertex(vertex.wrapped, gp_Pnt(4, 2, 3), 1e-7)
+        self.assertEqual(vertex.X, 1, "the fixture must retain stale Python coordinates")
+        self.assertNotEqual(hash(vertex), before)
+        self.assertEqual(hash(vertex), hash(Vertex(4, 2, 3)))
+        self.assert_same_bucket(vertex, alias)
+
+    def test_native_location_edit_uses_current_world_coordinates(self) -> None:
+        from build123d import Location, Vertex
+
+        vertex = Vertex(1, 2, 3)
+        vertex.wrapped.Location(Location((3, 4, 5)).wrapped)
+        self.assertEqual((vertex.X, vertex.Y, vertex.Z), (1, 2, 3))
+        self.assertEqual(hash(vertex), hash(Vertex(4, 6, 8)))
+
+
 if __name__ == "__main__":
     unittest.main()

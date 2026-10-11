@@ -2,16 +2,16 @@
 
 A generic 60 x 40 x 4 mm plate with four 4.5 mm diameter through holes at
 (+/-24, +/-14) mm. It tests the v0.5 script decorators, STEP/GLB outputs,
-build123d DXF generation, document inspection and rendering. It is not a
+build123d DXF generation, Python document checks (`checks/plate.py`;
+the `cadgen step inspect` CLI was removed upstream in 0.7.x) and rendering. It is not a
 model-quality benchmark or a product fixture.
 
-From the repository root, with the fork runtime installed:
+From the repository root, with the plugin's pinned cadgen runtime:
 
 ```sh
 python models/evaluations/upstream-v05-smoke/src/plate.py
 python models/evaluations/upstream-v05-smoke/src/plate_drawing.py
-cadgen step inspect validate models/evaluations/upstream-v05-smoke/STEP/plate.step --json
-cadgen step inspect refs models/evaluations/upstream-v05-smoke/STEP/plate.step --facts --json
+python models/evaluations/upstream-v05-smoke/checks/plate.py
 cadgen step snapshot models/evaluations/upstream-v05-smoke/STEP/plate.step models/evaluations/upstream-v05-smoke/plate.png
 ```
 

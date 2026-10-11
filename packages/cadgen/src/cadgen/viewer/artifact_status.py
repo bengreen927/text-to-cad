@@ -4,26 +4,14 @@ What this module deliberately does NOT decide is "is a build in flight". The
 caller supplies a snapshot (``build_progress.py``: the daemon's job ledger,
 matched to the document by declared output path) and this module reads it.
 
-Nothing here imports cadgen. Status is answered for a directory of models by an
-interpreter that may have no kernel installed at all, and every read degrades to
-"no" rather than raising: a badge is not a render. The ONE exception is
-containment — an out-of-root ``?file=`` ref raises before anything is read,
-because that is a refusal rather than a missing file.
+The server answers status without loading the CAD kernel. Missing or damaged
+required geometry means not compiled. Complete native geometry means compiled;
+SURF derivation and browser pixels have separate lifecycles. A ref that is not an
+absolute path raises before any store read.
 
-Freshness semantics:
-
-* a tree must exist, parse, declare the exact kind, and have every component
-  payload on disk;
-* nothing else is gated. The tree KEY is ``<sha256(document)>-v<schema>``, so
-  a tree that resolved at all has the right schema and belongs to exactly
-  these bytes — the old schema, bake, and per-poll digest gates all collapsed
-  into content keying, and that digest re-hash was the one full-file read every
-  status poll used to pay;
-* generated outputs are DETACHED from their source code: no source checks, ever;
-* the viewer never learns whether a document was generated. Nothing here opens a
-  record, a script or a closure (STORE.md §2, the law): status is artifact-side —
-  not compiled / compiling / rendered / failed — and "is this document behind its
-  source" is ``cadgen store why``'s question.
+The document's byte digest resolves through index/document to one immutable
+geometry tree. Its complete required closure must verify. Saved documents never
+consult source scripts, model records or source currency.
 """
 
 from __future__ import annotations
@@ -32,8 +20,8 @@ import json
 import os
 import re
 
-from .backend import require_contained
-from .store_paths import component_object_present, result_descriptor, result_tree
+from .backend import absolute_path
+from .store_paths import result_descriptor, result_tree
 
 __all__ = [
     "ARTIFACT_STATE",
@@ -46,7 +34,6 @@ __all__ = [
 ]
 
 STEP_PACKAGE_KIND = "assembly-package"
-STEP_DESCRIPTOR_NAME = "assembly.json"
 
 # Artifacts only: model scripts are not status subjects.
 #
@@ -62,22 +49,20 @@ _STEP_ENTRY_RE = re.compile(r"\.(step|stp)\Z", re.IGNORECASE)
 
 
 class ARTIFACT_STATE:  # noqa: N801 - a namespace of wire constants, not a class
-    RENDERED = "rendered"
+    COMPILED = "compiled"
     COMPILING = "compiling"
     NOT_COMPILED = "not-compiled"
     FAILED = "failed"
 
 
-# Codes the client may build on. ``missing_source_path`` and
-# ``missing_dxf_output`` are unreachable from ``_validate_step`` today; the set
-# stays literal so a future code lands in the right branch rather than falling
-# through to the error arm.
+# Codes the client may build on. ``missing_dxf_output`` is unreachable from
+# ``_validate_step`` today; the set stays literal so a future code lands in the
+# right branch rather than falling through to the error arm.
 BUILDABLE_CODES = frozenset(
     {
         "missing_glb",
         "missing_step_topology",
         "unsupported_step_topology",
-        "missing_source_path",
         "missing_dxf_output",
     }
 )
@@ -107,6 +92,15 @@ def _read_json(file_path):
     return parsed if isinstance(parsed, dict) else None
 
 
+# A migration a project still owes -- a leftover ``<name>.step.js``, a sidecar
+# written to an older schema -- is announced by the BUILD and by the cad skill,
+# where the words reach whoever can act on them and the next step is a command
+# to run. The viewer is not that place: it shows the document it is handed, and
+# what a stale neighbour costs (no kinematics, no materials, no routine) is
+# already visible there as the absence of those controls. Status is about this
+# document's own state and carries nothing about its neighbours.
+
+
 def owns_step_path(file_path) -> bool:
     return bool(_STEP_ENTRY_RE.search(str(file_path or "")))
 
@@ -125,36 +119,16 @@ def owns_artifact_path(file_path) -> bool:
     return owns_step_path(file_path) or owns_dxf_path(file_path)
 
 
-def resolve_candidate(file_ref, root_dir) -> str | None:
-    """An absolute path INSIDE ``root_dir`` that EXISTS, or ``None``.
+def resolve_candidate(file_ref) -> str | None:
+    """The absolute path ``file_ref`` names when that file exists, else ``None``.
 
-    Backslashes become slashes before the absoluteness test, so on POSIX a
-    Windows-shaped ``C:\\x`` becomes ``C:/x`` and is treated as relative.
-
-    Containment is checked here and RAISES rather than answering ``None``,
-    which is the one place this module departs from "every read degrades to no".
-    It is not a read: an out-of-root ref is a refusal the route funnel turns
-    into 403, exactly as the asset route already did, and answering ``None``
-    would launder it into the far softer "Artifact source not found".
+    A ref that is not an absolute path RAISES (``ValueError``, a 400) rather than
+    answering ``None``, which is the one place this module departs from "every
+    read degrades to no": it is not a read but a request this server never takes,
+    and answering ``None`` would launder it into "Artifact source not found".
     """
-    normalized = str(file_ref or "").strip().replace("\\", "/")
-    if not normalized:
-        return None
-    if os.path.isabs(normalized):
-        candidate = os.path.abspath(normalized)
-    else:
-        # ``lstrip("/")`` alone does not make a relative ref safe: "../.." still
-        # walks out of the root once joined, which is why containment is
-        # enforced on the RESULT rather than on the spelling.
-        candidate = os.path.abspath(os.path.join(root_dir, normalized.lstrip("/")))
-    require_contained(os.path.abspath(str(root_dir)), candidate)
-    try:
-        exists = os.path.exists(candidate)
-    except ValueError:
-        # A NUL byte in the path. Node's existsSync answers false rather than
-        # throwing, and the caller turns that into "source not found".
-        return None
-    return candidate if exists else None
+    candidate = absolute_path(file_ref)
+    return candidate if os.path.exists(candidate) else None
 
 
 def _component_values(descriptor):
@@ -200,20 +174,14 @@ def _validate_step(step_path: str) -> dict:
             "tree": tree,
             "descriptor": descriptor,
         }
-    for component in components:
-        surf = str((component or {}).get("surfObject") or "") if isinstance(component, dict) else ""
-        if not surf or not component_object_present(surf):
-            return {
-                "ok": False,
-                "code": "missing_glb",
-                "tree": tree,
-                "descriptor": descriptor,
-            }
+    # result_descriptor captured the full required geometry closure. Optional
+    # SURF/TESS availability is a separate runtime capability and cannot make
+    # this document need another compile.
     return {"ok": True, "tree": tree, "descriptor": descriptor}
 
 
-def resolve_artifact_verdict(file_ref, root_dir) -> dict:
-    candidate = resolve_candidate(file_ref, root_dir)
+def resolve_artifact_verdict(file_ref) -> dict:
+    candidate = resolve_candidate(file_ref)
     if candidate is None:
         return {"error": f"Artifact source not found: {file_ref}"}
     if owns_step_path(candidate):
@@ -223,7 +191,7 @@ def resolve_artifact_verdict(file_ref, root_dir) -> dict:
     return {"error": f"No render-artifact format owns this entry: {file_ref}"}
 
 
-def artifact_status(file_ref, root_dir, *, snapshot=None, verdict=None) -> dict:
+def artifact_status(file_ref, *, snapshot=None, verdict=None) -> dict:
     """The ``GET /__cad/artifact`` state machine.
 
     ``snapshot`` is the build view from the daemon's job ledger
@@ -236,7 +204,7 @@ def artifact_status(file_ref, root_dir, *, snapshot=None, verdict=None) -> dict:
     needs it again to decide whether to offer a compile.
     """
     if verdict is None:
-        verdict = resolve_artifact_verdict(file_ref, root_dir)
+        verdict = resolve_artifact_verdict(file_ref)
     if verdict.get("error"):
         return {"state": ARTIFACT_STATE.FAILED, "error": verdict["error"]}
 
@@ -253,7 +221,7 @@ def artifact_status(file_ref, root_dir, *, snapshot=None, verdict=None) -> dict:
 
     failed = snapshot.get("failed")
     if verdict.get("ok"):
-        status = {"state": ARTIFACT_STATE.RENDERED}
+        status = {"state": ARTIFACT_STATE.COMPILED}
         if isinstance(failed, dict):
             # The tree renders; the latest build of this document failed. Both
             # facts, the render first.

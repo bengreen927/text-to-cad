@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from cadgen._internal.glb_topology import STEP_EDGE_DEFAULT_RENDER_VISIBILITY_CLASSES
 
@@ -33,10 +33,14 @@ class SelectorOptions:
 class LoadedStepScene:
     step_path: Path
     roots: list["OccurrenceNode"]
-    prototype_shapes: dict[int, Any]
+    prototype_shapes: Mapping[int, Any]
     prototype_names: dict[int, str | None] = field(default_factory=dict)
     prototype_colors: dict[int, ColorRGBA] = field(default_factory=dict)
     prototype_face_colors: dict[int, dict[int, ColorRGBA]] = field(default_factory=dict)
+    # Prototype key -> (codec, BREP object hash) of the stored component it was
+    # decoded from, where the scene knows it: the facts a scene's edge policy
+    # reads are then remembered by that BREP (store.bounds.cached_component_topology).
+    prototype_components: dict[int, tuple[str, str]] = field(default_factory=dict)
     load_elapsed: float = 0.0
     step_hash: str | None = None
     source_kind: str = "step"
@@ -45,10 +49,19 @@ class LoadedStepScene:
     # refs resolved to numbers during the tree build, then written into the
     # model's sidecar).
     kinematics: dict[str, Any] | None = None
+    materials: dict[str, Any] | None = None
+    animation: dict[str, str] | None = None
     source_hash: str | None = None
     source_closure_hash: str | None = None
     source_closure_files: tuple[str, ...] = ()
     source_closure_file_hashes: dict[str, str] = field(default_factory=dict)
+    # Sliced helper files -> the names the build reached in them (record.closure.names)
+    # and their whole-file hashes (record.closure.wholes).
+    source_closure_names: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    source_closure_wholes: dict[str, str] = field(default_factory=dict)
+    # Listed folders -> the entries their digests leave out, the model's own
+    # outputs (record.closure.own).
+    source_closure_own: dict[str, tuple[str, ...]] = field(default_factory=dict)
     # Literals imported from model files, tracked by value (record.constants).
     source_closure_constants: dict[str, dict[str, str]] = field(default_factory=dict)
     # `cadgen step build IN OUT` only: the INPUT document's content hash (the
@@ -65,6 +78,11 @@ class LoadedStepScene:
     # occurrences (interference) walk this tree instead when present.
     instance_occurrence_tree: dict[str, Any] | None = None
     doc: Any | None = None
+    # A reference scene (cadgen.store._references.source_scene) decodes its
+    # prototypes only to classify the topology for the adaptive edge policy;
+    # the build reads geometry from the pinned trees. The generator may drop
+    # them once that policy is decided, before the export owns its own copy.
+    disposable_prototypes: bool = False
 
 
 @dataclass(frozen=True)
@@ -147,5 +165,4 @@ def _identity_transform_matrix() -> tuple[float, ...]:
         0.0,
         1.0,
     )
-
 

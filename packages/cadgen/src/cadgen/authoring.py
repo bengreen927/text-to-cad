@@ -1,5 +1,4 @@
-"""The library-first authoring surface: ``@step`` and ``@dxf``
-(design/library-first-generation.md).
+"""The library-first authoring surface: ``@step`` and ``@dxf``.
 
 A CAD model is a plain Python script; the decorator declares the model and
 ``__main__`` builds it by calling it::
@@ -23,19 +22,22 @@ Semantics:
 - **A top-level call builds.** Calling the decorated name when no build is in
   progress (``__main__``, a REPL, a test) runs the full pipeline — freshness
   gate, progress, incremental package build, ``.step``/``.dxf`` output —
-  via the warm daemon when available, in-process otherwise. It returns
-  ``None``: the caller is the build's initiator, and loading the shape back
-  into it would force the kernel import the gate exists to avoid. A failed
-  build raises ``SystemExit`` with the pipeline's exit code, so ``python
-  model.py`` exits the way a build should.
+  via the warm daemon when available, in-process otherwise. A real-file
+  ``__main__`` bare call whose result is immediately discarded returns
+  ``None`` without loading the shape back into the initiator. Callers that use
+  the result, and interactive or instrumented callers, receive the materialized
+  shape. A failed build raises ``SystemExit`` with the pipeline's exit code, so
+  ``python model.py`` exits the way a build should.
 - **A call inside a build composes.** While a build is running (any model's,
   any thread of this process), calling a decorated name runs its body and
   returns the shape (or drawing) — this is how an assembly uses its children.
   A model called from inside another model's build is a CHILD: it is built (or
   loaded from the store when current) and its tree is linked into the parent.
-- **One model per file.** Entry identity (refs, packages, closures) is keyed
-  by the source file everywhere in the pipeline, so a file defines exactly one
-  ``@step`` or ``@dxf`` model.
+- **A model is ``script::function``.** A file may hold several models; each is
+  its own record, output and job (``cadgen.store.index.model_ref``), and they
+  share the file's closure. ``__main__`` builds the ones it calls -- there is no
+  flag that selects a model. A file's sole model writes ``<file>.<fmt>``; models
+  sharing a file each write ``<function>.<fmt>``.
 
 Per-run flags ride ``sys.argv`` of the top-level call: ``--force``,
 ``--verbose``, ``--json``, ``--mesh-tolerance``,
@@ -51,6 +53,7 @@ script's body costs ~0.2s before the gate and the warm handoff run.
 from __future__ import annotations
 
 import contextlib
+import dis
 import functools
 import inspect
 import os
@@ -76,6 +79,52 @@ __all__ = [
     "building",
     "build_in_progress",
 ]
+
+
+def _caller_discards_model_result() -> bool:
+    """Whether this wrapper's real-file ``__main__`` caller immediately POP_TOPs.
+
+    This is deliberately a one-way proof: every observer, unfamiliar runtime,
+    synthetic module and bytecode uncertainty keeps the historical materialized
+    return. The caller is two frames above this helper (helper -> model wrapper
+    -> call site).
+    """
+    if sys.implementation.name != "cpython":
+        return False
+    if sys.gettrace() is not None or sys.getprofile() is not None:
+        return False
+    monitoring = getattr(sys, "monitoring", None)
+    if monitoring is not None:
+        try:
+            if any(monitoring.get_tool(tool_id) is not None for tool_id in range(6)):
+                return False
+        except Exception:
+            return False
+    try:
+        caller = sys._getframe(2)
+        if caller.f_trace is not None:
+            return False
+        if caller.f_code.co_name != "<module>" or caller.f_globals.get("__name__") != "__main__":
+            return False
+        main_module = sys.modules.get("__main__")
+        if main_module is None or caller.f_globals is not vars(main_module):
+            return False
+        filename = Path(caller.f_code.co_filename)
+        declared_filename = Path(str(caller.f_globals.get("__file__", "")))
+        if (
+            filename.suffix.lower() != ".py"
+            or not filename.is_file()
+            or declared_filename.resolve() != filename.resolve()
+        ):
+            return False
+        following = next(
+            (instruction for instruction in dis.get_instructions(caller.f_code)
+             if instruction.offset > caller.f_lasti),
+            None,
+        )
+        return following is not None and following.opname == "POP_TOP"
+    except Exception:
+        return False
 
 
 # Whether a build is running on this thread. The pipeline enters ``building()``
@@ -114,8 +163,56 @@ class BuildFrame:
         return self.pins.setdefault(str(child), tree)
 
     def child_trees(self) -> list[tuple[str, str]]:
-        """Every child call with the tree it resolved to; waits for pending jobs."""
+        """Every child call with its final source result; saves may still be pending."""
         return [(child, lazy.tree_hash()) for child, lazy in self.children]
+
+    def wait_children(self) -> None:
+        failure = None
+        seen = set()
+        for child, lazy in self.children:
+            if child in seen:
+                continue
+            seen.add(child)
+            try:
+                lazy.wait_outputs()
+                # Discarded calls are dependencies too: absent pinned objects
+                # cannot be admitted merely because their output files exist.
+                lazy.tree_hash()
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
+
+
+@contextlib.contextmanager
+def settle_child_builds(*, only_if_unowned: bool = False):
+    """A run retains and drains all child jobs, including after its own failure."""
+    frames = []
+    previous = getattr(_BUILD_STATE, "completion_frames", None)
+    if only_if_unowned and previous is not None:
+        yield
+        return
+    _BUILD_STATE.completion_frames = frames
+    error = None
+    try:
+        yield
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        _BUILD_STATE.completion_frames = previous
+        failure = None
+        for frame in frames:
+            try:
+                frame.wait_children()
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            if error is None:
+                raise failure
+            error.add_note(str(failure))
 
 
 def _same_file(left: Path, right: Path) -> bool:
@@ -142,6 +239,9 @@ def building(script_path: Path | None = None, function: str | None = None) -> It
     if frames is None:
         frames = _BUILD_STATE.frames = []
     frame = BuildFrame(script_path, function)
+    completion = getattr(_BUILD_STATE, "completion_frames", None)
+    if completion is not None:
+        completion.append(frame)
     frames.append(frame)
     try:
         yield frame
@@ -162,6 +262,10 @@ class ModelDef:
     # Typed mates (kinematics= dict, validated at decoration); axis refs
     # resolve at build and the block lands in the model's sidecar. STEP only.
     kinematics: KinematicsDef | None = None
+    # Named intrinsic material declarations and the document-scoped animation
+    # module. Both are validated at decoration and resolved during publication.
+    materials: dict[str, Any] | None = None
+    animation: dict[str, str] | None = None
     # Declared mesh serializations (@stl/@glb/@threemf). STEP models only.
     mesh_exports: tuple[MeshExportDecl, ...] = ()
     # False for a MESH-ONLY model (@stl/@glb/@threemf with no @step): the same
@@ -192,6 +296,30 @@ class ModelDef:
 # Keyed by model ref (``script::function``). A file may hold several models --
 # each its own record, output and job; they share the file's closure.
 _REGISTRY: dict[str, ModelDef] = {}
+
+# Keyed by resolved script path: every first-party file EXECUTED while the
+# generation loader last loaded the script, with its (mtime_ns, size) then. A
+# model's declarations are evaluated at import from whatever the script imports
+# (``from lib.dims import NAME`` feeding ``out=``), so a registry entry is only as
+# fresh as ALL of those files, not just the script's own bytes -- a warm worker
+# that checked the script alone rebuilt an edited helper's model under its OLD
+# output name. A script that registered by running as ``__main__`` has no entry:
+# that process executed it from disk itself.
+_IMPORT_CLOSURES: dict[Path, tuple[tuple[Path, tuple[int, int] | None], ...]] = {}
+
+
+def record_import_closure(script_path: Path, executed_files) -> None:
+    """Remember which files fed ``script_path``'s registrations, and their bytes."""
+    resolved = Path(script_path).resolve()
+    _IMPORT_CLOSURES[resolved] = tuple(
+        (path, _script_stamp(path)) for path in sorted(executed_files) if path != resolved
+    )
+
+
+def import_closure_current(script_path: Path) -> bool:
+    """False once any file that fed the script's last load holds different bytes."""
+    closure = _IMPORT_CLOSURES.get(Path(script_path).resolve(), ())
+    return all(_script_stamp(path) == stamp for path, stamp in closure)
 
 
 def registered_model(script_path: Path, function: str | None = None) -> ModelDef | None:
@@ -284,9 +412,12 @@ class _Declaring:
             # hook below prints it as that script's one-line failure.
             exc.__cadgen_declaration__ = True  # type: ignore[attr-defined]
             return False
-        from cadgen._internal.cli_errors import report_cli_error
+        from cadgen._internal.cli_from_function import report_failure
 
-        report_cli_error(exc, tool=f"python {self.script.name}", verbose="--verbose" in sys.argv[1:])
+        report_failure(
+            exc, prog=f"python {self.script.name}",
+            as_json="--json" in sys.argv[1:], verbose="--verbose" in sys.argv[1:],
+        )
         raise SystemExit(1)
 
 
@@ -296,11 +427,14 @@ def _report_uncaught_declaration(exc_type, exc, tb) -> None:
     arguments) is reported like the runner reports a build failure, instead of
     a traceback. Anything else goes to the previous hook."""
     main = sys.modules.get("__main__")
-    file = getattr(main, "__file__", None) if main is not None else None
+    # CPython 3.13.15+ and 3.14.7+ (gh-152132) remove ``__main__.__file__`` before
+    # they call this hook; a ``python script.py`` run still names the script in
+    # ``sys.argv[0]``.
+    file = getattr(main, "__file__", None) or (sys.argv[0] if sys.argv else None)
     if getattr(exc, "__cadgen_declaration__", False) and file and "--verbose" not in sys.argv[1:]:
-        from cadgen._internal.cli_errors import report_cli_error
+        from cadgen._internal.cli_from_function import report_failure
 
-        report_cli_error(exc, tool=f"python {Path(file).name}", verbose=False)
+        report_failure(exc, prog=f"python {Path(file).name}", as_json="--json" in sys.argv[1:])
         return
     _PREVIOUS_EXCEPTHOOK(exc_type, exc, tb)
 
@@ -354,12 +488,18 @@ def _decorator(
     mesh_tolerance: float | None,
     mesh_angular_tolerance: float | None,
     kinematics: object = None,
+    materials: object = None,
+    animation: object = None,
     step_output: bool = True,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     with _declaring_here():
         kinematics_def = (
             normalize_kinematics(kinematics, where=f"@{fmt}") if kinematics is not None else None
         )
+        from cadgen._internal.source_sidecar import normalize_animation, normalize_materials
+
+        materials_def = normalize_materials(materials, where=f"@{fmt} materials=")
+        animation_def = normalize_animation(animation, where=f"@{fmt} animation=")
         out = _checked_out(out, where=f"@{fmt}")
         mesh_tolerance = _checked_tolerance(mesh_tolerance, "mesh_tolerance", where=f"@{fmt}")
         mesh_angular_tolerance = _checked_tolerance(
@@ -390,6 +530,15 @@ def _decorator(
             func = prior.func
         _validate_signature(func, fmt=fmt)
         script_path = _script_path_of(func)
+        if animation_def is not None:
+            # The renderer refuses a module exporting anything but `clips`, and
+            # every clip with it: say so here, in its words, not when it opens.
+            from cadgen._internal.animation_source import check_animation_exports
+            from cadgen.render import relative_to_cwd
+
+            check_animation_exports(
+                animation_def["source"], name=f"{relative_to_cwd(script_path)}::{func.__name__} animation"
+            )
         defn = ModelDef(
             func=func,
             fmt=fmt,
@@ -398,6 +547,8 @@ def _decorator(
             mesh_tolerance=mesh_tolerance,
             mesh_angular_tolerance=mesh_angular_tolerance,
             kinematics=kinematics_def,
+            materials=materials_def,
+            animation=animation_def,
             mesh_exports=pending,
             step_output=step_output,
             stamp=_script_stamp(script_path),
@@ -437,15 +588,28 @@ def _decorator(
             # mesh decorator stacked ABOVE @step since `defn` was captured, so read it
             # back rather than closing over the original.
             current = _REGISTRY.get(defn.ref, defn)
-            code = _build(current)
+            from cadgen.daemon.executors import capture_source_result
+
+            with capture_source_result(current.ref) as built:
+                code = _build(current)
+                built._finish(code)
             if code != 0:
                 raise SystemExit(code)
+            tree = built.wait_result() if current.fmt == "step" else None
+            if current.fmt == "step" and _caller_discards_model_result():
+                return None
             # ...and hands back the geometry it built (or found current), so a plain
-            # script, a notebook or a REPL gets the shape a parent would: the model's
-            # tree materialized. A drawing has no tree and returns None.
-            return _built_geometry(current)
+            # used return, notebook or REPL gets the shape a parent would: the model's
+            # tree materialized. A drawing has no tree and returns None. The bare-call
+            # shortcut above still waits for the checked source result before deciding,
+            # so persistence failures remain observable.
+            return _built_geometry(current, tree=tree)
 
         model.__cadgen_model__ = defn  # type: ignore[attr-defined]
+        # A model's body runs in its own build, reached through a pin -- never
+        # inline behind a caller's closure. functools.wraps would hand it out as
+        # __wrapped__ (``arm.__wrapped__()``, ``inspect.unwrap``).
+        del model.__wrapped__
         return model
 
     return apply
@@ -458,16 +622,19 @@ def step(
     mesh_tolerance: float | None = None,
     mesh_angular_tolerance: float | None = None,
     kinematics: object = None,
+    materials: object = None,
+    animation: str | None = None,
     **unsupported: Any,
 ):
     """Declare a STEP model. Usable bare (``@step``) or configured (``@step(...)``).
 
-    ``kinematics=`` takes the typed-mates dict (see ``cadgen.kinematics``). No
+    ``kinematics=`` takes the typed-mates dict (see ``cadgen.kinematics``).
+    ``materials=`` declares named definitions and label/group assignments;
+    ``animation=`` embeds a self-contained JavaScript ES module. No
     decorator argument changes the geometry a model writes: the geometry is the
     function's return value; the arguments decide where the files land, how
     they are written, and what the sidecar declares. No decorator names
-    JavaScript: choreography is the render module beside the document
-    (``<name>.step.js``), which the viewer loads by name and no build reads.
+    declaration changes the STEP geometry or its authored colors.
     """
     with _declaring_here():
         _reject_unknown_kwargs("step", unsupported)
@@ -477,6 +644,8 @@ def step(
         mesh_tolerance=mesh_tolerance,
         mesh_angular_tolerance=mesh_angular_tolerance,
         kinematics=kinematics,
+        materials=materials,
+        animation=animation,
     )
     return decorator(func) if func is not None else decorator
 
@@ -657,8 +826,10 @@ def _compose_child(defn: ModelDef) -> Any:
             f"{defn.script_path.name}::{defn.name} is called while it is itself being built: "
             "a model may not depend on itself"
         )
+    from cadgen.daemon import telemetry
     from cadgen.daemon.executors import emit_event, model_event, submit
 
+    telemetry.job_child()  # an assembly, for a build this process counts itself (``cold_build``)
     parent = frame.model if frame is not None else None
     job = None
     tree: str | None = frame.pins.get(child) if frame is not None else None
@@ -676,9 +847,7 @@ def _compose_child(defn: ModelDef) -> Any:
         else:
             # Current: pin its tree NOW, at the call. A rebuild of this child between
             # here and the force must not change what this build composes.
-            from cadgen.store.records import read_record
-
-            tree = str((read_record(child) or {}).get("tree") or "") or None
+            tree = verdict.tree
             # No work: the tree summarizes current children on the parent's line.
             emit_event(model_event(child, "current", parent=parent))
     lazy = LazyCompound(child, job, frame=frame, label=defn.name, tree=tree)
@@ -693,7 +862,16 @@ def _frames() -> list[BuildFrame]:
 
 def _build(defn: ModelDef) -> int:
     """Run the pipeline for a top-level call of a model and return its exit code."""
-    argv = sys.argv[1:]
+    # The user's flags are parsed HERE, in the process they started, before any
+    # handoff: `--help` and a usage error end the run now (exit 0 / exit 2) on the
+    # warm path exactly as on the cold one. Handed to the daemon unparsed, `--help`
+    # came back as a job that exited 0 having built nothing, and the wait for its
+    # source result raised. The parser is argparse over stdlib -- no CAD import.
+    from cadgen.cli._run_model import check_user_flags
+
+    argv = check_user_flags(
+        sys.argv[1:], prog=f"python {defn.script_path.name}", called=defn.name
+    )
     _maybe_hint_eager_imports(defn)
 
     # This process is the ROOT of a build tree: it owns the terminal and renders the
@@ -730,20 +908,23 @@ def _build(defn: ModelDef) -> int:
         # (cadgen._internal.dxf_emit), so a cold run needs no interpreter restart and
         # @dxf reaches the pipeline by exactly the route @step does.
         from cadgen.cli._run_model import run_model_argv
+        from cadgen.daemon import telemetry
 
-        return run_model_argv([*target, *argv], prog=f"python {defn.script_path.name}")
+        # Counted here as the daemon counts the builds it answers: no daemon answered this one.
+        return telemetry.cold_build(
+            "dxf" if defn.fmt == "dxf" else "step", "script",
+            lambda: run_model_argv([*target, *argv], prog=f"python {defn.script_path.name}"),
+            meshes=bool(defn.mesh_exports),
+        )
 
 
-def _built_geometry(defn: ModelDef) -> Any:
+def _built_geometry(defn: ModelDef, *, tree: str | None) -> Any:
     """What a top-level call hands back after its build: the model's tree,
     materialized -- the geometry a parent composing this model would receive.
-    None for a drawing (no tree) or when no record was left."""
+    None for a drawing (no tree). Never resolves a mutable model record."""
     if defn.fmt != "step":
         return None
     from cadgen.store.lazy import materialize_model
-    from cadgen.store.records import read_record
-
-    tree = str((read_record(defn.ref) or {}).get("tree") or "")
     if not tree:
-        return None
+        raise RuntimeError(f"{defn.ref}: successful build supplied no source result")
     return materialize_model(tree, label=defn.name)

@@ -7,14 +7,15 @@
 # and stayed broken from 0.4.0 to 0.4.18 because no test ever executed the one command the
 # skill documents.
 #
-# The command below is that command: `cadgen viewer --host 127.0.0.1 --json`, spelled
+# The command below is that command: `cadgen viewer --host 127.0.0.1 --json --detach`, spelled
 # `python -m cadgen.viewer` so the interpreter is explicit. Keep it identical to the one
-# in skills/cad-viewer/SKILL.md; if the doc changes, this changes with it. Launching is
-# unconditional (the server rolls to a free port and prints the real URL/port), so this
-# script chooses no port: it reads the port from the --json line, exactly as an agent
-# does. It serves the client the WHEEL ships -- cadgen/_runtime/viewer, written by
+# in skills/cad/SKILL.md; keep its launch options aligned with this test. One addition:
+# `--port` with a port nobody holds, because the default (3245) is the developer's own
+# viewer on a workstation, and a launch there would reuse it -- or, running other code,
+# replace it. The URL is still read from the --json line, exactly as an agent does. It
+# serves the client the WHEEL ships -- cadgen/_runtime/viewer, written by
 # scripts/bundle/bundle.sh -- pinned through CADGEN_VIEWER_DIST so a checkout's own
-# apps/viewer/dist cannot stand in for it. Run bundle.sh first, exactly as test.yml does.
+# apps/web/dist cannot stand in for it. Run bundle.sh first, exactly as test.yml does.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,8 +39,8 @@ export CADGEN_VIEWER_DIST="$RUNTIME"
 
 log="$(mktemp)"
 serve_root="$(mktemp -d)"
-# This is the interpreter that plays the role of "the one that installed
-# skills/cad-viewer/requirements.txt" -- the server is a module of that cadgen.
+# This is the interpreter that plays the role of "the one the CAD skill's
+# launch command runs" -- the server is a module of that cadgen.
 #
 # Resolution FALLS BACK instead of demanding a repo venv, because there are two
 # venv-less callers and both are ordinary:
@@ -66,7 +67,12 @@ pick_interpreter() {
   if [ -n "${VIEWER_PYTHON:-}" ]; then
     candidates=("$VIEWER_PYTHON")
   else
-    candidates=("$REPO_ROOT/.venv/bin/python" python3 python)
+    candidates=(
+      "$REPO_ROOT/.venv/bin/python"
+      "$REPO_ROOT/.venv/Scripts/python.exe"
+      python3
+      python
+    )
   fi
 
   local candidate resolved
@@ -88,7 +94,7 @@ if ! pick_interpreter; then
   if [ -n "${VIEWER_PYTHON:-}" ]; then
     echo "FAIL: VIEWER_PYTHON=$VIEWER_PYTHON cannot run, or cannot import cadgen." >&2
   elif [ -z "$FOUND_INTERPRETER" ]; then
-    echo "FAIL: no Python interpreter found (tried $REPO_ROOT/.venv/bin/python, python3, python)." >&2
+    echo "FAIL: no Python interpreter found (tried the repo venv, python3, and python)." >&2
     echo "      Set VIEWER_PYTHON to the one that installed requirements-dev.txt." >&2
     exit 1
   else
@@ -101,39 +107,54 @@ fi
 echo "    interpreter: $PYTHON"
 # Cold: a smoke test spawns no build daemon.
 export CADGEN_DAEMON=0
+unset CADGEN_BROKER CADGEN_BROKER_KEY CADGEN_BROKER_STATS CADGEN_ROOT_ID
 # Isolated store: content keying would otherwise resolve the fixture against
 # the developer's real cache and skip the import this smoke test exists to run.
 export CADGEN_CACHE_DIR="$(mktemp -d)"
-# The launcher has no directory flag: the cwd IS the served directory, so the
-# launch cd's there first — exactly as SKILL.md instructs. `exec` makes the
-# subshell BECOME the python process, so $! is the server's pid.
-(cd "$serve_root" && exec "$PYTHON" -m cadgen.viewer --host "$HOST" --json) > "$log" 2>&1 &
-server_pid=$!
-disown "$server_pid" 2>/dev/null || true
-
+# A private state directory (the detached viewer's log, the analytics answer) and
+# temporary directory: nothing here touches the developer's own.
+private_tmp="$("$PYTHON" -c 'import tempfile; print(tempfile.mkdtemp(prefix="cv-"))')"
+export TMPDIR="$private_tmp" TEMP="$private_tmp" TMP="$private_tmp"
+export CADGEN_STATE_DIR="$private_tmp/state"
+export CADGEN_DAEMON_STATE_DIR="$private_tmp/daemon"
+PORT="$("$PYTHON" -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+STARTED=""
 cleanup() {
-  kill "$server_pid" 2>/dev/null || true
-  rm -rf "$serve_root" "$CADGEN_CACHE_DIR"
+  if [ -n "$STARTED" ]; then
+    "$PYTHON" -m cadgen.viewer stop --port "$PORT" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$serve_root" "$CADGEN_CACHE_DIR" "$private_tmp"
+  rm -f "$log"
 }
 trap cleanup EXIT
 
-# The port is an OUTPUT of launch: read it from the {url,port,action} JSON line.
-PORT=""
-for _ in $(seq 1 30); do
-  PORT="$(sed -n 's/^{.*"port":\([0-9]*\).*}$/\1/p' "$log" | tail -1)"
-  [ -n "$PORT" ] && break
-  if ! kill -0 "$server_pid" 2>/dev/null; then
-    echo "FAIL: the server exited before printing its contract" >&2
-    sed 's/^/    /' "$log" >&2
-    exit 1
-  fi
-  sleep 1
-done
-if [ -z "$PORT" ]; then
-  echo "FAIL: no {url,port,action} JSON line appeared" >&2
+# A file is named by its absolute path, so the folder a launch runs in only decides
+# where a developer's relative links resolve. --detach makes the command RETURN once
+# the server announces itself: the server keeps running in the background, writing
+# to the viewer log in the state directory, and $log holds only what the launcher
+# itself said. A launcher that never returned would hang here rather than fail, so
+# the documented command is bounded where the platform can bound it.
+bounded=()
+if command -v timeout >/dev/null 2>&1; then
+  bounded=(timeout 120)
+fi
+if ! launch_json="$(cd "$serve_root" && ${bounded[@]+"${bounded[@]}"} "$PYTHON" -m cadgen.viewer --host "$HOST" --port "$PORT" --json --detach 2>"$log")"; then
+  echo "FAIL: the detached launch did not return success" >&2
   sed 's/^/    /' "$log" >&2
   exit 1
 fi
+
+# The {url,port,action} JSON line is the whole of stdout under --json.
+if ! printf '%s' "$launch_json" | grep -q "^{\"url\":\"http://$HOST:$PORT/\",\"port\":$PORT,\"action\":\"started\"}\$"; then
+  echo "FAIL: no {url,port,action:started} JSON line on stdout: $launch_json" >&2
+  sed 's/^/    /' "$log" >&2
+  exit 1
+fi
+STARTED=1
+# What the detached server itself writes, for the failure messages below.
+server_log() {
+  cat "$CADGEN_STATE_DIR/viewer.log" 2>/dev/null || true
+}
 
 # The launcher writes the {url,port,action} line only after the socket is bound and
 # listening with the app attached (pinned by tests/python/packages/cadgen/viewer/test_launcher.py
@@ -152,7 +173,7 @@ for _ in $(seq 1 3); do
 done
 if [ "$status" != "200" ]; then
   echo "FAIL: no 200 from http://$HOST:$PORT/ within $attempt requests (last status: ${status:-none})" >&2
-  sed 's/^/    /' "$log" >&2
+  server_log | sed 's/^/    /' >&2
   exit 1
 fi
 
@@ -161,15 +182,16 @@ fi
 api="$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://$HOST:$PORT/__cad/server" || true)"
 if [ "$api" != "200" ]; then
   echo "FAIL: the page served but /__cad/server returned ${api:-none}" >&2
-  sed 's/^/    /' "$log" >&2
+  server_log | sed 's/^/    /' >&2
   exit 1
 fi
 
-# Launch idempotence: relaunching from the same directory at the same version must
-# REUSE the running viewer (same port, action:"reused"), not spawn a second instance.
-reuse_json="$(cd "$serve_root" && "$PYTHON" -m cadgen.viewer --host "$HOST" --json | grep '^{' | tail -1)"
+# Launch idempotence: relaunching at the same version -- from ANOTHER folder, since one
+# viewer serves every file -- must REUSE the running viewer (same port, action:"reused"),
+# not spawn a second instance.
+reuse_json="$(cd "$private_tmp" && "$PYTHON" -m cadgen.viewer --host "$HOST" --port "$PORT" --json --detach)"
 if ! printf '%s' "$reuse_json" | grep -q '"action":"reused"'; then
-  echo "FAIL: relaunching the same root did not reuse the running viewer: $reuse_json" >&2
+  echo "FAIL: relaunching did not reuse the running viewer: $reuse_json" >&2
   exit 1
 fi
 if ! printf '%s' "$reuse_json" | grep -q "\"port\":$PORT"; then
@@ -177,17 +199,26 @@ if ! printf '%s' "$reuse_json" | grep -q "\"port\":$PORT"; then
   exit 1
 fi
 
-# End-to-end compile FROM THE BUNDLE: a raw STEP in the served root goes
+# End-to-end display FROM THE BUNDLE: a raw STEP, named by its absolute path, goes
 # not-compiled -> POST (cadgen's compile entry point, a job in the pool)
-# -> rendered with a real tree in the store. The fixture is deliberately
-# non-LFS (CI checks out without LFS).
-FIXTURE="$REPO_ROOT/models/examples/imported/import-smoke.step"
+# -> compiled geometry -> a real browser load that derives and fetches its
+# display surface. Its small STEP fixture belongs to this test rather than the
+# repository's shared model workspace. Geometry completion and display readiness
+# are separate contracts: the artifact endpoint must stay "compiled" after the
+# geometry tree lands, while
+# the bundled client drives missing SURF work through /__cad/surfaces.
+FIXTURE="$REPO_ROOT/tests/fixtures/cad/import-smoke.step"
 if ! head -1 "$FIXTURE" | grep -q "ISO-10303-21"; then
-  echo "FAIL: import fixture is not STEP text (LFS pointer?): $FIXTURE" >&2
+  echo "FAIL: import fixture is not STEP text: $FIXTURE" >&2
   exit 1
 fi
 cp "$FIXTURE" "$serve_root/smoke.step"
-step_url="http://$HOST:$PORT/__cad/artifact?file=smoke.step"
+smoke_ref="$("$PYTHON" -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$serve_root/smoke.step")"
+if [ "$(curl -s -o /dev/null -m 10 -w '%{http_code}' "http://$HOST:$PORT/__cad/artifact?file=smoke.step")" != "400" ]; then
+  echo "FAIL: a relative ?file= was not refused (400)" >&2
+  exit 1
+fi
+step_url="http://$HOST:$PORT/__cad/artifact?file=$smoke_ref"
 status_json="$(curl -s -m 10 "$step_url")"
 if ! printf '%s' "$status_json" | grep -q '"not-compiled"'; then
   echo "FAIL: raw STEP did not report not-compiled: $status_json" >&2
@@ -197,33 +228,130 @@ if ! printf '%s' "$status_json" | grep -q '"compile":true'; then
   echo "FAIL: raw STEP status did not offer the compile: $status_json" >&2
   exit 1
 fi
-# The compile pays one cold interpreter + OCP start; give it a real timeout.
-build_json="$(curl -s -m 120 -X POST -H 'x-cadgen-viewer: 1' "$step_url")"
+# The POST starts the compile and answers at once; the status route says when it
+# has landed. The compile pays one cold interpreter + OCP start, so the wait for
+# that is bounded generously.
+build_json="$(curl -s -m 30 -X POST -H 'x-cadgen-viewer: 1' "$step_url")"
 if ! printf '%s' "$build_json" | grep -q '"ok":true'; then
-  echo "FAIL: the compile did not succeed: $build_json" >&2
+  echo "FAIL: the compile did not start: $build_json" >&2
   exit 1
 fi
+compile_deadline=$((SECONDS + 120))
+status_json="$(curl -s -m 10 "$step_url")"
+until printf '%s' "$status_json" | grep -q '"state":"compiled"'; do
+  if printf '%s' "$status_json" | grep -q '"state":"failed"'; then
+    echo "FAIL: the compile failed: $status_json" >&2
+    exit 1
+  fi
+  if [ "$SECONDS" -ge "$compile_deadline" ]; then
+    echo "FAIL: compiled STEP did not settle compiled: $status_json" >&2
+    exit 1
+  fi
+  sleep 0.5
+  status_json="$(curl -s -m 10 "$step_url")"
+done
 # The tree lands in the (isolated) store, keyed by the document's bytes.
 if ! ls "$CADGEN_CACHE_DIR"/index/document/* > /dev/null 2>&1; then
-  echo "FAIL: compile reported ok but the store indexes no document" >&2
+  echo "FAIL: compile reported compiled but the store indexes no document" >&2
   exit 1
 fi
-status_json="$(curl -s -m 10 "$step_url")"
-if ! printf '%s' "$status_json" | grep -q '"rendered"'; then
-  echo "FAIL: compiled STEP did not settle rendered: $status_json" >&2
+catalog_json="$(curl -s -m 10 "http://$HOST:$PORT/__cad/catalog?file=$smoke_ref")"
+if ! printf '%s' "$catalog_json" | grep -q '"url":"/__cad/store?file='; then
+  echo "FAIL: the compiled STEP's catalog row did not name its immutable tree: $catalog_json" >&2
   exit 1
 fi
 
-# The instance-manager side of the same entrypoint: list must show this server,
-# stop must end it.
-if ! "$PYTHON" -m cadgen.viewer list | grep -q "port $PORT"; then
-  echo "FAIL: 'cadgen viewer list' did not report the running viewer" >&2
-  exit 1
-fi
-if ! "$PYTHON" -m cadgen.viewer stop --port "$PORT" | grep -q "Stopped CAD Viewer"; then
+# Loading the page is load-bearing. Merely accepting the new compiled state
+# would let this smoke pass with a dead display path: a cold isolated store has
+# no SURF or TESS entries, so the bundled client must request exact surface
+# derivation, fetch the pinned SURF bytes, tessellate them, and clear its loading
+# overlay. CI installs Playwright's Chromium with requirements-dev.txt.
+"$PYTHON" - "http://$HOST:$PORT/?file=$smoke_ref" "$(cat "$REPO_ROOT/VERSION")" <<'PY'
+import sys
+import time
+from urllib.parse import parse_qs, urlparse
+
+from playwright.sync_api import sync_playwright
+
+url = sys.argv[1]
+responses = []
+page_errors = []
+surface_payload = None
+surface_fetches = set()
+
+with sync_playwright() as playwright:
+    browser = playwright.chromium.launch(
+        headless=True,
+        args=["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"],
+    )
+    try:
+        page = browser.new_page(viewport={"width": 1000, "height": 720})
+        # The startup update check must not depend on GitHub or its rate limit.
+        page.route(
+            "https://api.github.com/repos/earthtojake/text-to-cad/releases/latest",
+            lambda route: route.fulfill(json={"tag_name": f"v{sys.argv[2]}"}),
+        )
+        page.on("response", lambda response: responses.append(response))
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+
+        seen = 0
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            page.wait_for_timeout(100)
+            current = responses[seen:]
+            seen = len(responses)
+            for response in current:
+                request = response.request
+                parsed = urlparse(response.url)
+                if parsed.path == "/__cad/surfaces" and request.method == "POST" and response.ok:
+                    payload = response.json()
+                    components = payload.get("components") if isinstance(payload, dict) else None
+                    if components and all(row.get("state") == "ready" for row in components.values()):
+                        surface_payload = payload
+                elif parsed.path == "/__cad/store" and response.ok:
+                    query = parse_qs(parsed.query)
+                    if query.get("tree") and query.get("surfaceInput") and query.get("object"):
+                        surface_fetches.add(response.url)
+
+            overlay_gone = page.locator(".cad-loading-overlay").count() == 0
+            if surface_payload and surface_fetches and overlay_gone:
+                break
+
+        if page_errors:
+            raise RuntimeError("browser page error: " + " | ".join(page_errors))
+        if not surface_payload:
+            raise RuntimeError("bundled client did not complete a cold /__cad/surfaces request")
+        rows = surface_payload["components"]
+        missing = [
+            cid for cid, row in rows.items()
+            if not any(fetch.endswith(row["url"]) for fetch in surface_fetches)
+        ]
+        if missing:
+            raise RuntimeError("bundled client did not fetch pinned SURF bytes for: " + ", ".join(missing))
+        if page.locator(".cad-loading-overlay").count():
+            raise RuntimeError("bundled client did not finish tessellating the display surface")
+        canvases = page.locator("canvas")
+        if not canvases.count() or not any(canvases.nth(index).is_visible() for index in range(canvases.count())):
+            raise RuntimeError("bundled client completed surface work without a visible canvas")
+        alerts = [text.strip() for text in page.locator('[role="alert"]').all_text_contents() if text.strip()]
+        if alerts:
+            raise RuntimeError("bundled client reported an alert: " + " | ".join(alerts))
+        print(f"    bundled client displayed {len(rows)} cold-derived surface component(s)")
+    finally:
+        browser.close()
+PY
+
+# The other verb of the same entrypoint: stop must end it, and free its port.
+if ! "$PYTHON" -m cadgen.viewer stop --port "$PORT" | grep -q "Stopped CAD Viewer on port $PORT"; then
   echo "FAIL: 'cadgen viewer stop --port $PORT' did not stop the viewer" >&2
   exit 1
 fi
+STARTED=""
+if curl -s -o /dev/null -m 3 "http://$HOST:$PORT/__cad/server"; then
+  echo "FAIL: port $PORT still answers after 'cadgen viewer stop'" >&2
+  exit 1
+fi
 
-echo "    served / and /__cad/server on rolled port $PORT; cadgen step build e2e OK; reuse/list/stop OK"
+echo "    served / and /__cad/server on port $PORT; cadgen step compile + bundled display e2e OK; reuse/stop OK"
 echo "==> CAD Viewer launch smoke test passed"

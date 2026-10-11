@@ -109,10 +109,19 @@ def transform_bbox(matrix: list[float], bbox: object) -> dict[str, list[float]] 
 # line carries `origin`/`direction`, and a cylinder's `radius` is a length that a rigid transform
 # does not change. Anything unlisted is carried through untouched, which is right for ordinals,
 # counts, flags and areas -- and is why `params` is transformed key-by-key rather than wholesale.
+#
+# The param key sets are the COMPLETE vocabulary of `step_scene_geometry._curve_params` and
+# `_surface_params`, which is what writes the `params` this places (and the same set
+# `step_scene_geometry._transform_param_dict` classifies). A point is spelled `origin`
+# (plane/cylinder/cone/line) or `center` (circle/ellipse/hyperbola/parabola/sphere/torus),
+# never both, so a list that knows only one spelling silently leaves half the analytic types
+# in component-local coordinates -- which is what sent `inspect measure` between a circular
+# edge and a line 37 mm apart on an axis where they touch (tom-cad FEEDBACK issue 2). Any new
+# analytic type must land in one of these lists or be a scalar; that is the review question.
 _POINT_FIELDS = ("center",)
-_POINT_PARAM_KEYS = ("origin",)
+_POINT_PARAM_KEYS = ("origin", "center", "location")
 _DIRECTION_FIELDS = ("normal",)
-_DIRECTION_PARAM_KEYS = ("axis", "direction")
+_DIRECTION_PARAM_KEYS = ("axis", "direction", "normal")
 
 
 def transform_direction(matrix: list[float], vector: object) -> list[float] | None:
@@ -189,9 +198,9 @@ def _place_entity_row(matrix: list[float], row: Mapping[str, Any]) -> dict[str, 
 
 
 def _read_component_bundle(package_dir: Path, component: str):
-    """A component's topology bundle, from its exact-surface artifact
-    (design/surface-rendering.md R5). Pre-surf packages fail the schema
-    gate and rebuild before ever reaching here, so .surf is the only form."""
+    """A component's topology bundle, from its exact-surface artifact.
+    Pre-surf packages fail the schema gate and rebuild before ever reaching
+    here, so .surf is the only form."""
     surf_path = package_dir / COMPONENTS_DIRNAME / f"{component}.surf"
     if not surf_path.is_file():
         return None
@@ -219,12 +228,14 @@ def _component_occurrence_bbox(bundle: object) -> object:
 
 def assembly_occurrence_rows(
     descriptor: Mapping[str, Any],
-    package_dir: Path,
+    package_dir: Path | None,
 ) -> list[dict[str, Any]]:
     """Instance-tree occurrences as selector-index rows, in world coordinates at rest.
 
     Column names mirror the topology sidecar's ``occurrenceColumns`` so that consumers written
     against that table (``entry_summary``, ``reporting``) need no special case for assemblies.
+    With ``package_dir`` None no component's ``.surf`` is read and no row has a ``bbox``: the
+    rows are the occurrence namespace alone, what a kinematics mate's ends resolve in.
     """
     rows = descriptor.get("occurrences")
     if not isinstance(rows, list):
@@ -244,7 +255,7 @@ def assembly_occurrence_rows(
             if component not in bbox_by_component:
                 # Deduped by content hash: tom_v2 has 160 occurrences over 65 components, and
                 # the whole set reads in well under a second.
-                bundle = _read_component_bundle(package_dir, component)
+                bundle = _read_component_bundle(package_dir, component) if package_dir is not None else None
                 bbox_by_component[component] = _component_occurrence_bbox(bundle)
             local_bbox = bbox_by_component[component]
         materialized.append(
@@ -547,7 +558,7 @@ def assembly_group_nodes(descriptor: Mapping[str, Any]) -> dict[str, dict[str, A
 def merge_assembly_occurrences(
     index: SelectorIndex,
     descriptor: Mapping[str, Any],
-    package_dir: Path,
+    package_dir: Path | None,
 ) -> SelectorIndex:
     """Add the instance-tree occurrences to a flat whole-assembly index.
 
