@@ -1,6 +1,6 @@
 ---
 name: dxf
-description: Generate, regenerate, and validate 2D DXF drawings from Python build123d sources. Use for DXF files, `.py` drawing scripts, @dxf models, 2D profiles, outlines, templates, gaskets, panels, flat patterns, laser/plasma/waterjet cut layouts, 2D drawing exports of CAD geometry, and engineering drawing sheet review. Open and visually review existing DXF files in CAD Viewer.
+description: Generate, regenerate, and validate 2D DXF drawings from Python build123d sources. Use for DXF files, `.py` drawing scripts, @dxf models, 2D profiles, outlines, templates, gaskets, panels, flat patterns, laser/plasma/waterjet cut layouts, and 2D drawing exports of CAD geometry. Open and visually review existing DXF files in CAD Viewer.
 license: MIT
 ---
 
@@ -37,11 +37,9 @@ geometry, generate validated drawing artifacts, and return checked outputs. A
 DXF drawing's source of truth is a Python file named `<name>.py` defining one
 parameterless `@dxf` model function.
 
-For dimensioned engineering sheets, read
-[engineering-drawing-sheets.md](references/engineering-drawing-sheets.md).
-It covers view, dimension, and print-quality review. The `@dxf` authoring API
-produces profile geometry; semantic dimensions and title blocks need a separate
-document-authoring workflow.
+For a dimensioned engineering sheet (views, dimensions, title block), use
+`$engineering-drawing`. A `@dxf` model produces profile geometry, not a
+dimensioned document.
 
 **A drawing is a model.** It has the same wrapper, record, freshness gate and
 build job a `@step` part has; its one output is the `.dxf` file; it has no

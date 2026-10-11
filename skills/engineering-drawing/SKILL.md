@@ -81,7 +81,8 @@ The first run downloads that installation; later runs reuse it.
    a view, that hidden lines appear where features are behind faces, that every
    hole has a centre mark, and that no leader crosses the part. Very small
    dimensions (a few mm) put their value on their own extension line; dimension
-   the larger feature instead. Move `at=` or `offset=` and rerun.
+   the larger feature instead. Move `at=` or `offset=` and rerun. For the
+   full sheet-quality checklist, see [sheet review](references/sheet-review.md).
 
 ## What the sheet contains
 

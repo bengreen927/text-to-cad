@@ -14,8 +14,8 @@ project. Do not copy them into a shared skill repository.
    likely measurement value.
 2. Establish one absolute scale and a documented scale for every image used.
 3. Record pixel measurements, conversions, and uncertainty with source paths.
-4. Resolve one shared dimension table used by both `@dxf` drawings and `@step`
-   models.
+4. Resolve one shared dimension table used by `@dxf` profiles, `@step`
+   models, and engineering drawings.
 5. Review dimensioned orthographic drawings against the images before building
    detailed solids.
 6. Build the 3D parts and assembly from the same values.
@@ -72,14 +72,14 @@ and solid without copying a second table.
 Resolve externally maintained data before building, as described in
 [cad-as-config.md](cad-as-config.md).
 
-Each artifact still follows the current model contract. Put the drawing in a
+Each artifact still follows the current model contract. Put a 2D profile in a
 parameterless `@dxf` model file and the solid or assembly in a parameterless
 `@step` model file; both may call ordinary factories using the shared values.
-Run those scripts to produce documents. Pass the resulting `.dxf` or `.step`
-documents, never the Python source, to cadgen inspection and snapshot commands.
-Use the `$dxf` skill for drawing-sheet conventions. Its `@dxf` models generate
-profile geometry; semantic dimensions and title blocks require a separate
-document-authoring workflow. Keep that review sheet separate from CAM exports.
+Run those scripts to produce documents. Python checks and snapshot commands take
+the resulting `.dxf` or `.step` documents, never the Python source. For
+dimensioned orthographic views, use `$engineering-drawing`: it projects views
+from a part, so build a simple first solid from the table and draw it before
+adding detail. Keep review sheets separate from CAM exports.
 
 ## Drawings before detailed solids
 
@@ -111,8 +111,9 @@ then rebuild affected drawings and models.
 
 Then verify the documents with Python checks (see
 [inspection and validation](inspection-and-validation.md)). Open each STEP with
-`read_scene`; check bounds, solid count, and soundness with `topology_errors`
-and per-solid volume. For an assembly, measure `overlap_volume` for every
+`read_scene`; check bounds, solid count, and soundness with `topology_errors`,
+`boundary_edges`, per-solid volume, and `is_sound` or `self_intersections`
+where self-intersection matters. For an assembly, measure `overlap_volume` for every
 intended part pair at each required static state, and confirm the tested-pair
 count; no visible clash is not proof that hidden parts clear one another. Add
 targeted measurements for bores, fasteners, mating interfaces, and motion

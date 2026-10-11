@@ -5,20 +5,29 @@
 Base: upstream `main` at `b48ff49e` (release 0.7.20), merged into the fork on
 branch `sync-upstream-0.7.20`.
 
-- The fork's runtime patch is superseded. Upstream 0.7.x removed
+- The fork's runtime patch is superseded. Upstream 0.6.5 removed
   `cadgen step inspect` and `cadgen.interference` and replaced them with Python
   checks over `cadgen.geometry`. `overlap_volume` raises `GeometryError` when a
   boolean fails instead of returning zero, which is the fail-closed behavior the
-  fork's interference patch added. The fork now carries no Python runtime
-  changes, so the fork-built wheel described below is no longer needed. The
-  skills run the published `cadgen==0.7.20` through `uvx`.
+  fork's patch added. Pair coverage (empty selections, pairs skipped or not
+  reached) is no longer enforced by a runtime verdict; the check script owns it,
+  as `cad-as-config.md` and `inspection-and-validation.md` describe. The fork
+  carries no Python runtime changes, so the fork-built wheel below is no longer
+  needed. The skills and the plugin's `cad` MCP server run the published
+  `cadgen==0.7.20` through `uvx`.
 - The fork's guidance (`cad-as-config.md`, `reverse-engineering-from-photos.md`,
-  `engineering-drawing-sheets.md`, acceptance checks, frame contracts) is kept
-  and rewritten for the Python inspection API.
-- The publish, docs-deploy, and new API-deploy workflows run only in
+  acceptance checks, frame contracts) is kept and rewritten for the Python
+  inspection API. The sheet-quality checklist moved to
+  `skills/engineering-drawing/references/sheet-review.md`, because upstream's
+  `$engineering-drawing` skill (0.6.5) now makes dimensioned PDF sheets.
+- The publish, docs-deploy, and API-deploy workflows run only in
   `earthtojake/text-to-cad`.
-- Upstream 0.7.19 and later send telemetry; see the sync report before
-  installing this version.
+- cadgen sends usage telemetry to `api.texttocad.dev` by default since 0.7.16,
+  after a one-line notice, and checks for new versions daily. `cadgen telemetry
+  off` saves an opt-out that every cadgen process honors, including the build
+  daemon and a detached viewer. `DO_NOT_TRACK=1` or `CADGEN_TELEMETRY=0` cover
+  only the process that has them; the daemon and a detached viewer drop them.
+  `CADGEN_UPDATE_CHECK=0` turns off the version check.
 
 # Upstream v0.5.0 (historical)
 
@@ -43,12 +52,14 @@ under `docs/research/` and `models/evaluations/cad-as-config/` are historical
 v0.4 evidence, not v0.5 benchmarks; their old generators are not migration examples.
 
 The incomplete-interference safeguard is adapted to the new part/intra-part
-classification. Failure or truncation cannot become a no-clash pass. The
+classification (superseded in the 0.7.20 sync). Failure or truncation cannot become a no-clash pass. The
 upstream ownership rules for public PyPI releases and docs deployment are
 explicit in the publishing jobs, so syncing a fork does not publish upstream's
 package or website.
 
 ## Installing this fork's runtime
+
+Superseded 2026-10-11: the fork no longer carries runtime changes; see the 0.7.20 sync above.
 
 The plugin's requirements pin the upstream release number. Additional Python
 runtime fixes in this fork require installing the fork-built wheel, not just
@@ -72,6 +83,8 @@ the repository; retain its old environment until migrating and verifying it.
 Existing STEP/DXF/GLB documents remain usable independently of their generators.
 
 ## Upgrade verification
+
+Superseded 2026-10-11: the fork no longer carries runtime changes; see the 0.7.20 sync above.
 
 The generic fixture in `models/evaluations/upstream-v05-smoke/` exercises STEP,
 GLB, DXF, geometric validation, document facts, snapshots and unchanged rebuilds.

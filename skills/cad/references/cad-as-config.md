@@ -65,8 +65,8 @@ if __name__ == "__main__":
 
 Another configuration is another model entry point, normally in another file,
 calling the same factory. Put an `@dxf` drawing in its own model file and import
-the same dimensions. Run model scripts to build them. Inspection and snapshot
-commands take the resulting documents; they do not run a `.py` script.
+the same dimensions. Run model scripts to build them. Python checks and
+snapshot commands take the resulting documents; they do not run a `.py` script.
 
 Use one model per coherent artifact. Compose assembly children by importing and
 calling their model functions, express placement with native build123d joints
@@ -95,14 +95,14 @@ short list proves only what that list measured.
 
 | Requirement | Evidence |
 | --- | --- |
-| Sound geometry | Expected solid count, `topology_errors` and `boundary_edges` with no findings, positive finite volume per solid |
+| Sound geometry | Expected solid count, `topology_errors` and `boundary_edges` with no findings, positive finite volume per solid, and `is_sound` or `self_intersections` where self-intersection matters |
 | Correct size and position | Bounds, named datums, and required dimensions in the stated frame |
 | Pocket or through-hole | Empty passage at the intended position and full depth, plus surrounding material |
 | Assembly clearance | Pairwise shared volume and measured minimum distance at every required state |
 | Mating interface | Measured offsets, axes, and `closest_points` distances between the selected datums |
 | Interchangeability | Bidirectional rotated or mirrored residual and matching functional interfaces |
 | Regeneration | Nominal, changed, then nominal factory inputs yield equivalent nominal geometry |
-| Unchanged unrelated geometry | Scoped measurements or `overlap_volume` residuals against the accepted document |
+| Unchanged unrelated geometry | Scoped measurements against the accepted document; for an unchanged solid, `overlap_volume(old, new)` equals each solid's volume within tolerance |
 | Delivered document | Re-open the written STEP and repeat its critical checks and snapshot review |
 
 A cylindrical surface is not proof of a through-hole. A zero cutter residual can
@@ -128,7 +128,7 @@ failed or incomplete and separate from accepted deliverables.
 Checks may also run inside the decorated model body before it returns geometry,
 raising on required failure. Those checks run only when the body builds; a
 current model skips the body. Run the separate acceptance check before promoting
-an export even after a no-op. Defining `checks()` alone never executes it.
+an export even after a no-op. A check function that nothing calls never runs.
 
 ## Reproducible review
 

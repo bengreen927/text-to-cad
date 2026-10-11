@@ -18,7 +18,7 @@ Source: [Mason Hensley, CAD as Config, August 18 2026](https://gwaihirrobotics.c
 
 The initial adaptation contained an unvalidated helper that could report PASS for empty checks, failed advisories, or consumed iterators. Its hole matcher could mistake a cylindrical boss for a through-hole, and its revision key omitted generator dependencies. That helper is not adopted. The revised reference specifies complete evidence and required-check semantics instead.
 
-The existing interference runtime silently skipped Boolean/measurement failures and could return success after truncation. The implementation change makes those outcomes incomplete/error, covered by focused regression tests. Nominally valid CAD can still have wrong interfaces or inferred mechanisms; zero collision count is not a blanket approval.
+The existing interference runtime silently skipped Boolean/measurement failures and could return success after truncation. The implementation change makes those outcomes incomplete/error, covered by focused regression tests (removed in the 0.7.20 sync with the module they tested; upstream's `overlap_volume` now raises on failure). Nominally valid CAD can still have wrong interfaces or inferred mechanisms; zero collision count is not a blanket approval.
 
 ## Evaluation
 

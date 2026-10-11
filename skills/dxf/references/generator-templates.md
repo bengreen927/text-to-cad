@@ -178,11 +178,9 @@ if __name__ == "__main__":
 
 ## Common additions
 
-For a dimensioned sheet, use these templates for its underlying profile only
-and follow [engineering-drawing-sheets.md](engineering-drawing-sheets.md) for
-sheet review. The former ezdxf document-return template is omitted because
-`@dxf` accepts build123d geometry, not a document. Engraved text outlines do not
-replace semantic dimensions, dimension styles, or paper layouts.
+For a dimensioned sheet, use `$engineering-drawing`; these templates make
+profiles and cut layouts only. Engraved text outlines do not replace real
+dimensions or a title block.
 
 - **Bend / fold lines**: put them on a layer whose name contains `bend`
   (`{"CUT": profile, "BEND": fold_lines}`). Open geometry is allowed there, and

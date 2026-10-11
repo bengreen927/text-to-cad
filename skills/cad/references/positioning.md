@@ -97,6 +97,11 @@ features with `read_scene` before choosing datums. Express measured offsets
 or joint frames in the source, then validate the placed result. Anchor model
 input paths on `__file__` when they must work from any working directory.
 
+Preserve an imported shape's existing placement when adding a project
+placement. Compose with `Location * shape` or `.moved()`; do not replace or
+flatten an unknown source frame. Record the source document and the datum used
+to place it.
+
 ```bash
 python path/to/assembly.py
 python tmp/check_assembly.py
